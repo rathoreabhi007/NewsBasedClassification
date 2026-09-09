@@ -1,0 +1,1731 @@
+import os
+import re
+import json
+import math
+import glob
+import random
+import warnings
+import csv
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from collections import Counter
+from typing import List, Dict, Any, Union, Tuple, Optional
+
+# ---------------------------------------------------------------------------
+# 1. Standard Regulatory & Financial Patterns
+# ---------------------------------------------------------------------------
+FINANCIAL_PATTERNS = {
+    "LEI": re.compile(r"^[A-Z0-9]{18}[0-9]{2}$", re.IGNORECASE),
+    "ISIN": re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$", re.IGNORECASE),
+    "CUSIP": re.compile(r"^[0-9A-Z]{9}$", re.IGNORECASE),
+    "SEDOL": re.compile(r"^[B-Z0-9]{7}$", re.IGNORECASE),
+    "FIGI": re.compile(r"^BBG[A-Z0-9]{9}$", re.IGNORECASE),
+    "BIC_SWIFT": re.compile(r"^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$", re.IGNORECASE),
+    "IBAN": re.compile(r"^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$", re.IGNORECASE),
+    "MIC": re.compile(r"^[A-Z0-9]{4}$", re.IGNORECASE),
+    "ISO_CURRENCY": re.compile(r"^(USD|EUR|GBP|JPY|CHF|CAD|AUD|HKD|SGD|SEK|NOK|NZD|CNY|INR|BRL|ZAR|KRW|MXN)$", re.IGNORECASE),
+    "ISO_COUNTRY": re.compile(r"^[A-Z]{2}$", re.IGNORECASE),
+}
+
+BOOLEAN_TOKENS = [
+    {"y", "n"}, {"yes", "no"}, {"true", "false"}, {"0", "1"}, {"t", "f"}, {"buy", "sell"}, {"b", "s"}, {"credit", "debit"}
+]
+
+BENFORD_EXPECTED = {d: math.log10(1 + 1 / d) for d in range(1, 10)}
+
+
+# ---------------------------------------------------------------------------
+# 1b. Check-digit validators for identifiers that have a defined checksum.
+#     Shape (regex) alone can't distinguish a real ISIN/LEI/CUSIP/IBAN from
+#     an arbitrary string of the right length and character set, so these
+#     are used to raise confidence when a match also passes its checksum,
+#     and to flag it as a coincidental shape match when it doesn't.
+# ---------------------------------------------------------------------------
+
+def _alnum_to_digits(s: str) -> str:
+    """Convert A-Z to 10-35 (the standard convention for these checksums)
+    and leave digits as-is, concatenating into one digit string."""
+    out = []
+    for ch in s:
+        if ch.isdigit():
+            out.append(ch)
+        else:
+            out.append(str(ord(ch.upper()) - ord('A') + 10))
+    return "".join(out)
+
+
+def _luhn_valid(digit_string: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digit_string)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _isin_checksum_valid(code: str) -> bool:
+    code = code.upper().strip()
+    if len(code) != 12 or not code[11].isdigit():
+        return False
+    try:
+        digit_string = _alnum_to_digits(code[:11]) + code[11]
+        return _luhn_valid(digit_string)
+    except ValueError:
+        return False
+
+
+def _lei_checksum_valid(code: str) -> bool:
+    code = code.upper().strip()
+    if len(code) != 20:
+        return False
+    try:
+        return int(_alnum_to_digits(code)) % 97 == 1
+    except ValueError:
+        return False
+
+
+def _iban_checksum_valid(code: str) -> bool:
+    code = code.upper().strip().replace(" ", "")
+    if len(code) < 4:
+        return False
+    try:
+        rearranged = code[4:] + code[:4]
+        return int(_alnum_to_digits(rearranged)) % 97 == 1
+    except ValueError:
+        return False
+
+
+def _cusip_checksum_valid(code: str) -> bool:
+    code = code.upper().strip()
+    if len(code) != 9:
+        return False
+    total = 0
+    for i, ch in enumerate(code[:8]):
+        if ch.isdigit():
+            v = int(ch)
+        elif ch.isalpha():
+            v = ord(ch) - ord('A') + 10
+        elif ch == '*':
+            v = 36
+        elif ch == '@':
+            v = 37
+        elif ch == '#':
+            v = 38
+        else:
+            return False
+        if i % 2 == 1:
+            v *= 2
+        total += v // 10 + v % 10
+    check = (10 - (total % 10)) % 10
+    return code[8].isdigit() and int(code[8]) == check
+
+
+# Only these four have a publicly defined, implementable check-digit
+# algorithm. SEDOL has one too but uses a non-standard letter-value table
+# and is left as shape-only here; MIC, FIGI, BIC and the ISO lists have no
+# checksum at all -- FIGI/ISO are still reliable because they're closed,
+# well-defined enumerations, but MIC and CUSIP-without-checksum-passing
+# should be treated as weaker signals (handled in semantic role inference).
+CHECKSUM_VALIDATORS = {
+    "ISIN": _isin_checksum_valid,
+    "LEI": _lei_checksum_valid,
+    "IBAN": _iban_checksum_valid,
+    "CUSIP": _cusip_checksum_valid,
+}
+
+
+# ---------------------------------------------------------------------------
+# 2. Universal Financial Column Accumulator with Temporal Slicing
+# ---------------------------------------------------------------------------
+class FinancialColumnAccumulator:
+    def __init__(self, col_name: str, max_sample_size: int = 20000):
+        self.col_name = col_name
+        self.max_sample_size = max_sample_size
+
+        self.total_rows = 0
+        self.null_count = 0
+        self.empty_str_count = 0
+        self.whitespace_count = 0
+        self.raw_dtypes = Counter()
+
+        self.value_counts = Counter()
+        self.max_tracked_distinct = 50000
+
+        # FIX (cardinality cap bug): value_counts is intentionally capped at
+        # max_tracked_distinct for memory (it only needs to hold enough to
+        # report a top-15 frequency table). But distinct_count/cardinality_
+        # ratio/is_unique were previously read off len(value_counts), so any
+        # column that crossed the cap (e.g. a 120k-row trade-ID column)
+        # silently reported a capped, wrong distinct count and stopped being
+        # recognized as an Entity Identifier. This tracks true distinct
+        # values separately and uncapped via 64-bit value hashes rather than
+        # full strings, which is cheap enough to scale to tens of millions
+        # of distinct values without holding the actual value text.
+        self.distinct_value_hashes: set = set()
+
+        # FIX (memory-safety cap): the set above is uncapped by design, but
+        # "uncapped" collides badly with very large files that also have a
+        # genuinely high-cardinality column (e.g. a trade/row ID on a
+        # multi-hundred-million-row file) -- tracking tens of millions of
+        # 64-bit hashes per such column, times several columns, was enough
+        # to exhaust memory and crash the whole file's ingestion, which the
+        # broad except in _profile_single_source then silently turned into
+        # an empty ERROR profile (a "blank" dashboard, with the real cause
+        # buried in a message the caller never printed). This hard cap
+        # stops growing the set once it's clearly established the column is
+        # high-cardinality, and reports distinct_count as a lower bound
+        # instead of risking an OOM.
+        self.max_exact_distinct = 5_000_000
+        self.distinct_count_capped = False
+
+        # FIX (dropped-junk bug): when a chunk is >80% numeric or >80% date,
+        # only the values that parsed as that type were ever recorded
+        # anywhere except populated_count/value_counts. The unparseable
+        # remainder (e.g. "PENDING" in a settlement-amount column) vanished
+        # from every other stat and never tripped a quality signal. These
+        # tally that remainder explicitly. string_count separately tracks
+        # rows that went through _update_string (i.e. truly string-dominant
+        # chunks), so it can be told apart from junk-inside-numeric/date.
+        self.string_count = 0
+        self.non_conforming_count = 0
+        self.non_conforming_samples = Counter()
+
+        # Numeric State
+        self.num_count = 0
+        self.sum_val = 0.0
+        self.sum_sq = 0.0
+        self.min_val = float('inf')
+        self.max_val = float('-inf')
+        self.zero_count = 0
+        self.negative_count = 0
+        self.infinite_count = 0
+        self.min_abs_nonzero = float('inf')
+        self.max_abs_nonzero = float('-inf')
+        self.numeric_samples: List[float] = []
+        self.numeric_seen = 0  # total finite values seen, for reservoir sampling
+        self.first_digits = Counter()
+
+        # Temporal State & Multi-Grain Aggregations
+        self.date_count = 0
+        self.min_date = None
+        self.max_date = None
+        self.year_dist = Counter()
+        self.halfyear_dist = Counter()
+        self.quarter_dist = Counter()
+        self.month_dist = Counter()
+        self.dow_dist = Counter()
+        self.future_date_count = 0
+        self.has_time_component = False
+
+        # String State
+        self.str_lengths: List[int] = []
+        self.str_len_seen = 0  # total lengths seen, for reservoir sampling
+        self.case_counts = Counter({"UPPER": 0, "LOWER": 0, "MIXED": 0, "NUMERIC_STR": 0})
+        self.regex_matches = Counter({k: 0 for k in FINANCIAL_PATTERNS.keys()})
+        self.checksum_valid_matches = Counter({k: 0 for k in CHECKSUM_VALIDATORS.keys()})
+
+    @staticmethod
+    def _reservoir_update(reservoir: List[Any], seen_so_far: int, new_values: List[Any], cap: int) -> int:
+        """Algorithm R reservoir sampling extended to accept a batch of new
+        values, maintaining a uniform random sample of size <= cap over the
+        *entire* stream seen so far -- not just whichever values happened to
+        arrive first. Without this, percentiles/skew/outliers computed from
+        the sample are biased toward the start of the file (e.g. if the file
+        happens to be sorted by date or size)."""
+        for v in new_values:
+            seen_so_far += 1
+            if len(reservoir) < cap:
+                reservoir.append(v)
+            else:
+                j = random.randint(0, seen_so_far - 1)
+                if j < cap:
+                    reservoir[j] = v
+        return seen_so_far
+
+    def update(self, series: pd.Series):
+        n = len(series)
+        self.total_rows += n
+        self.raw_dtypes[str(series.dtype)] += 1
+
+        null_mask = series.isna()
+        self.null_count += int(null_mask.sum())
+
+        valid_series = series.dropna()
+        if valid_series.empty:
+            return
+
+        str_series = valid_series.astype(str)
+        empty_mask = str_series.eq("")
+        ws_mask = str_series.str.isspace()
+
+        self.empty_str_count += int(empty_mask.sum())
+        self.whitespace_count += int(ws_mask.sum())
+
+        populated = valid_series[~empty_mask & ~ws_mask]
+        if populated.empty:
+            return
+
+        # FIX (silent-sampling bug): value_counts previously only scanned the
+        # first 2000 rows of each chunk, so distinct_count / cardinality_ratio
+        # / is_unique / frequency_distribution were all computed from a small,
+        # non-random slice of the data. This vectorizes over the FULL
+        # populated set of the chunk; only the *total distinct* count is
+        # capped (memory safety), not which rows get counted.
+        pop_str = str_series.loc[populated.index].str.strip()
+        vc = pop_str.value_counts()
+        if len(self.value_counts) >= self.max_tracked_distinct:
+            already_known = vc.index.intersection(self.value_counts.keys())
+            for val, cnt in vc.loc[already_known].items():
+                self.value_counts[val] += int(cnt)
+        else:
+            for val, cnt in vc.items():
+                if val in self.value_counts or len(self.value_counts) < self.max_tracked_distinct:
+                    self.value_counts[val] += int(cnt)
+
+        # FIX (cardinality cap bug): uncapped true-distinct tracking via
+        # vectorized value hashing, independent of the capped value_counts
+        # table above. hash_pandas_object hashes every element (not just the
+        # ones that survived the cap), so distinct_count stays accurate no
+        # matter how high the column's cardinality goes -- up to the hard
+        # memory-safety cap below.
+        if not self.distinct_count_capped:
+            value_hashes = pd.util.hash_pandas_object(pop_str, index=False)
+            self.distinct_value_hashes.update(value_hashes.to_numpy().tolist())
+            if len(self.distinct_value_hashes) >= self.max_exact_distinct:
+                self.distinct_count_capped = True
+
+        num_converted = pd.to_numeric(populated, errors='coerce')
+        valid_nums = num_converted.dropna()
+
+        if len(valid_nums) / len(populated) > 0.8:
+            self._update_numeric(valid_nums)
+            # FIX (dropped-junk bug): the <20% that failed to parse as
+            # numeric here previously just disappeared from every stat
+            # except populated_count/value_counts.
+            leftover_mask = num_converted.isna()
+            if leftover_mask.any():
+                self._track_non_conforming(populated[leftover_mask])
+        else:
+            date_converted = pd.to_datetime(populated, errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
+            valid_dates = date_converted.dropna()
+            if len(valid_dates) / len(populated) > 0.8:
+                self._update_temporal(valid_dates)
+                leftover_mask = date_converted.isna()
+                if leftover_mask.any():
+                    self._track_non_conforming(populated[leftover_mask])
+            else:
+                self._update_string(populated.astype(str))
+
+    def _update_numeric(self, nums: pd.Series):
+        cnt = len(nums)
+        if cnt == 0:
+            return
+
+        self.num_count += cnt
+
+        # FIX (non-finite guard): "inf"/"-inf"/"Infinity" strings coerce
+        # cleanly via pd.to_numeric and would otherwise poison sum/min/max/
+        # mean for the whole column. Finite values still get full stats;
+        # infinities are counted separately and excluded from arithmetic.
+        finite_mask = np.isfinite(nums.to_numpy(dtype=float))
+        finite_nums = nums[finite_mask]
+        self.infinite_count += cnt - int(finite_mask.sum())
+
+        if finite_nums.empty:
+            return
+
+        self.sum_val += float(finite_nums.sum())
+        self.sum_sq += float((finite_nums ** 2).sum())
+        self.min_val = min(self.min_val, float(finite_nums.min()))
+        self.max_val = max(self.max_val, float(finite_nums.max()))
+        self.zero_count += int((finite_nums == 0).sum())
+        self.negative_count += int((finite_nums < 0).sum())
+
+        abs_nums = finite_nums.abs()
+        non_zeros = abs_nums[abs_nums > 0]
+        if not non_zeros.empty:
+            self.min_abs_nonzero = min(self.min_abs_nonzero, float(non_zeros.min()))
+            self.max_abs_nonzero = max(self.max_abs_nonzero, float(non_zeros.max()))
+            first_digits = non_zeros.astype(str).str.replace(r'^[0\.]+', '', regex=True).str[0]
+            digit_counts = first_digits.value_counts()
+            for d_str, count in digit_counts.items():
+                if d_str in "123456789":
+                    self.first_digits[int(d_str)] += int(count)
+
+        # FIX (sampling bias): reservoir sample instead of "first N seen".
+        self.numeric_seen = self._reservoir_update(
+            self.numeric_samples, self.numeric_seen, finite_nums.tolist(), self.max_sample_size
+        )
+
+    def _update_temporal(self, dates: pd.Series):
+        self.date_count += len(dates)
+        cur_min = dates.min()
+        cur_max = dates.max()
+
+        if self.min_date is None or cur_min < self.min_date:
+            self.min_date = cur_min
+        if self.max_date is None or cur_max > self.max_date:
+            self.max_date = cur_max
+
+        now = pd.Timestamp.now()
+        self.future_date_count += int((dates > now).sum())
+
+        years = dates.dt.strftime("%Y")
+        quarters = dates.dt.to_period('Q').astype(str)
+        months = dates.dt.strftime("%Y-%m")
+        halfyears = dates.dt.year.astype(str) + "-H" + ((dates.dt.month > 6).astype(int) + 1).astype(str)
+
+        for y, cnt in years.value_counts().items():
+            self.year_dist[y] += int(cnt)
+        for hy, cnt in halfyears.value_counts().items():
+            self.halfyear_dist[hy] += int(cnt)
+        for q, cnt in quarters.value_counts().items():
+            self.quarter_dist[q] += int(cnt)
+        for m, cnt in months.value_counts().items():
+            self.month_dist[m] += int(cnt)
+        for dow, cnt in dates.dt.day_name().value_counts().items():
+            self.dow_dist[dow] += int(cnt)
+
+        if (dates.dt.time != pd.Timestamp("00:00:00").time()).any():
+            self.has_time_component = True
+
+    def _track_non_conforming(self, leftovers: pd.Series):
+        """Values that fail to parse as the column's dominant type within an
+        otherwise numeric- or date-dominant chunk (e.g. 'PENDING'/'N/A'
+        sitting in a settlement-amount column). These are real populated
+        values that deserve visibility, so they get a count and a small
+        capped sample of what they actually look like -- not full string
+        profiling, just enough for type_consistency and a risk alert."""
+        self.non_conforming_count += len(leftovers)
+        sample_strs = leftovers.astype(str).str.strip()
+        for val, cnt in sample_strs.value_counts().items():
+            if val in self.non_conforming_samples or len(self.non_conforming_samples) < 20:
+                self.non_conforming_samples[val] += int(cnt)
+
+    def _update_string(self, strs: pd.Series):
+        self.string_count += len(strs)
+        lens = strs.str.len()
+        # FIX (sampling bias): reservoir sample instead of "first N seen".
+        self.str_len_seen = self._reservoir_update(
+            self.str_lengths, self.str_len_seen, lens.tolist(), self.max_sample_size
+        )
+
+        upper_mask = strs.str.isupper()
+        lower_mask = strs.str.islower()
+        numeric_mask = strs.str.isnumeric()
+        # FIX (missing bucket): true mixed-case strings (e.g. "AbC123")
+        # matched none of UPPER/LOWER/NUMERIC_STR before and were never
+        # counted anywhere, so case_pattern silently ignored them.
+        mixed_mask = ~upper_mask & ~lower_mask & ~numeric_mask
+
+        self.case_counts["UPPER"] += int(upper_mask.sum())
+        self.case_counts["LOWER"] += int(lower_mask.sum())
+        self.case_counts["NUMERIC_STR"] += int(numeric_mask.sum())
+        self.case_counts["MIXED"] += int(mixed_mask.sum())
+
+        # FIX (perf + checksum validation): vectorized str.match instead of
+        # a per-row Python lambda, plus check-digit validation for the
+        # identifier types that have one (see CHECKSUM_VALIDATORS above).
+        sample = strs.iloc[:500].str.strip()
+        for name, pat in FINANCIAL_PATTERNS.items():
+            shape_mask = sample.str.match(pat.pattern, flags=re.IGNORECASE)
+            shape_cnt = int(shape_mask.sum())
+            self.regex_matches[name] += shape_cnt
+
+            validator = CHECKSUM_VALIDATORS.get(name)
+            if validator is not None and shape_cnt > 0:
+                checksum_cnt = int(sample[shape_mask].apply(validator).sum())
+                self.checksum_valid_matches[name] += checksum_cnt
+
+    def finalize(self) -> Dict[str, Any]:
+        populated_cnt = self.total_rows - self.null_count - self.empty_str_count - self.whitespace_count
+
+        # FIX (cardinality cap bug): distinct_count/cardinality_ratio/
+        # is_unique now come from the uncapped hash set, not len(value_counts)
+        # (which is capped at max_tracked_distinct purely for the frequency
+        # table). Previously a column with more distinct values than the cap
+        # reported a truncated distinct_count and a cardinality_ratio well
+        # below 1.0, so is_unique came back False and the "Entity Identifier"
+        # role was never assigned to high-cardinality ID columns.
+        distinct_count = len(self.distinct_value_hashes)
+        cardinality_ratio = (distinct_count / populated_cnt) if populated_cnt > 0 else 0.0
+
+        # FIX (schema-drift bug): type was previously decided as
+        # "is_numeric OR is_date, else string" using two independent 80%
+        # thresholds. If a column's type drifted across chunks (e.g. 60%
+        # numeric chunks, 40% date chunks -- neither crosses 80%), it fell
+        # into the string branch even though _update_string was never
+        # called for any of its rows, producing an all-zero string_stats
+        # block for a column that actually had real data. This instead
+        # picks whichever type accounted for the most rows, and flags the
+        # column as "MIXED" (with a breakdown) when no type has a clear
+        # majority, instead of silently mis-reporting it as empty text.
+        #
+        # FIX (dropped-junk bug): string_count now only reflects rows that
+        # actually went through _update_string (genuinely string-dominant
+        # chunks). Non-numeric/non-date leftovers from numeric/date-dominant
+        # chunks are tracked separately in non_conforming_count so they show
+        # up explicitly instead of being silently folded into "string".
+        type_counts = {"numeric": self.num_count, "date": self.date_count, "string": self.string_count}
+        if populated_cnt > 0:
+            dominant_type, dominant_count = max(type_counts.items(), key=lambda kv: kv[1])
+            dominant_ratio = dominant_count / populated_cnt
+        else:
+            dominant_type, dominant_ratio = "string", 0.0
+
+        is_numeric = dominant_type == "numeric"
+        is_date = dominant_type == "date"
+        type_consistency = "CONSISTENT" if dominant_ratio >= 0.8 else "MIXED"
+        non_conforming_pct = round((self.non_conforming_count / populated_cnt) * 100, 2) if populated_cnt > 0 else 0.0
+
+        top_freq = []
+        for val, cnt in self.value_counts.most_common(15):
+            pct = round((cnt / populated_cnt) * 100, 2) if populated_cnt > 0 else 0
+            top_freq.append({"value": val, "count": cnt, "percentage": pct})
+
+        res = {
+            "field_name": self.col_name,
+            "detected_dtype": self.raw_dtypes.most_common(1)[0][0] if self.raw_dtypes else "unknown",
+            "total_rows": self.total_rows,
+            "populated_count": populated_cnt,
+            "null_count": self.null_count,
+            "empty_string_count": self.empty_str_count,
+            "whitespace_count": self.whitespace_count,
+            "populated_pct": round((populated_cnt / self.total_rows) * 100, 2) if self.total_rows > 0 else 0,
+            "null_pct": round((self.null_count / self.total_rows) * 100, 2) if self.total_rows > 0 else 0,
+            "distinct_count": distinct_count,
+            "distinct_count_is_lower_bound": self.distinct_count_capped,
+            "cardinality_ratio": round(cardinality_ratio, 4),
+            "is_constant": distinct_count == 1 and not self.distinct_count_capped,
+            "is_unique": (not self.distinct_count_capped) and cardinality_ratio == 1.0 and populated_cnt == self.total_rows,
+            "frequency_distribution": top_freq,
+            "type_consistency": type_consistency,
+            "non_conforming_count": self.non_conforming_count,
+            "non_conforming_pct": non_conforming_pct,
+        }
+        # Show the type breakdown whenever there's something to explain --
+        # either the dominant type didn't clear 80% (MIXED), or it did but
+        # there's still non-conforming junk hiding inside it that would
+        # otherwise be invisible (e.g. 85% numeric / 15% "PENDING").
+        if (type_consistency == "MIXED" or self.non_conforming_count > 0) and populated_cnt > 0:
+            full_breakdown = dict(type_counts)
+            full_breakdown["non_conforming"] = self.non_conforming_count
+            res["type_breakdown_pct"] = {
+                k: round((v / populated_cnt) * 100, 2) for k, v in full_breakdown.items()
+            }
+        if self.non_conforming_samples:
+            res["non_conforming_samples"] = [
+                {"value": v, "count": c} for v, c in self.non_conforming_samples.most_common(10)
+            ]
+
+        if is_numeric and self.num_count > 0:
+            mean = self.sum_val / self.num_count
+            variance = max(0.0, (self.sum_sq / self.num_count) - (mean ** 2))
+            std_dev = math.sqrt(variance)
+
+            arr = np.array(self.numeric_samples)
+            if len(arr) > 0:
+                p1, p5, p10, p25, p50, p75, p90, p95, p99 = np.percentile(arr, [1, 5, 10, 25, 50, 75, 90, 95, 99])
+                iqr = p75 - p25
+                outliers = int(np.sum((arr < (p25 - 1.5 * iqr)) | (arr > (p75 + 1.5 * iqr))))
+                skewness = float(pd.Series(arr).skew()) if len(arr) > 2 else 0.0
+            else:
+                p1 = p5 = p10 = p25 = p50 = p75 = p90 = p95 = p99 = 0.0
+                outliers = 0
+                skewness = 0.0
+
+            res["numeric_stats"] = {
+                "min": round(self.min_val, 4) if not math.isinf(self.min_val) else 0.0,
+                "max": round(self.max_val, 4) if not math.isinf(self.max_val) else 0.0,
+                "mean": round(mean, 4),
+                "median": round(float(p50), 4),
+                "std_dev": round(std_dev, 4),
+                "variance": round(variance, 4),
+                "skewness": round(skewness, 4),
+                "zero_count": self.zero_count,
+                "negative_count": self.negative_count,
+                "infinite_count": self.infinite_count,
+                "percentiles": {
+                    "p1": round(float(p1), 4), "p5": round(float(p5), 4), "p10": round(float(p10), 4),
+                    "p25": round(float(p25), 4), "p50": round(float(p50), 4), "p75": round(float(p75), 4),
+                    "p90": round(float(p90), 4), "p95": round(float(p95), 4), "p99": round(float(p99), 4)
+                },
+                "outlier_count_sample": outliers,
+                "benford_analysis": self._calculate_benford_mad()
+            }
+
+        elif is_date and self.date_count > 0:
+            span_days = (self.max_date - self.min_date).days if (self.min_date and self.max_date) else 0
+            res["temporal_stats"] = {
+                "min_date": str(self.min_date),
+                "max_date": str(self.max_date),
+                "span_days": span_days,
+                "granularity": "DATETIME" if self.has_time_component else "DATE",
+                "future_dated_count": self.future_date_count,
+                "yearly_distribution": dict(sorted(self.year_dist.items())),
+                "halfyearly_distribution": dict(sorted(self.halfyear_dist.items())),
+                "quarterly_distribution": dict(sorted(self.quarter_dist.items())),
+                "monthly_distribution": dict(sorted(self.month_dist.items())),
+                "day_of_week_distribution": dict(self.dow_dist)
+            }
+        else:
+            avg_len = sum(self.str_lengths) / len(self.str_lengths) if self.str_lengths else 0
+            res["string_stats"] = {
+                "min_length": min(self.str_lengths) if self.str_lengths else 0,
+                "max_length": max(self.str_lengths) if self.str_lengths else 0,
+                "avg_length": round(avg_len, 2),
+                "case_pattern": self.case_counts.most_common(1)[0][0] if sum(self.case_counts.values()) > 0 else "MIXED",
+                "regex_matches": dict(self.regex_matches),
+                "checksum_valid_matches": dict(self.checksum_valid_matches),
+            }
+
+        res["semantic_role"] = self._infer_semantic_role(res)
+        return res
+
+    def _calculate_benford_mad(self) -> Dict[str, Any]:
+        total_digits = sum(self.first_digits.values())
+        if total_digits < 100:
+            return {"status": "INSUFFICIENT_DATA", "mad": 0.0, "conformity": "N/A"}
+
+        # FIX (methodology): Benford's Law only holds for naturally-occurring
+        # magnitudes spanning multiple orders of ten (Nigrini's own
+        # precondition). Applying it unconditionally to any numeric column
+        # with >=100 observations flags bounded data (rates, percentages,
+        # ratings, quantities in a narrow band) as "anomalous" when nothing
+        # is actually wrong -- so this checks the value range first.
+        if self.max_abs_nonzero <= 0 or self.min_abs_nonzero <= 0:
+            magnitude_span = 0
+        else:
+            magnitude_span = self.max_abs_nonzero / self.min_abs_nonzero
+
+        if magnitude_span < 100:
+            return {
+                "status": "NOT_APPLICABLE",
+                "mad": 0.0,
+                "conformity": "N/A",
+                "reason": "Value range spans fewer than 2 orders of magnitude; "
+                          "Benford's Law preconditions are not met for this field."
+            }
+
+        actual_dist = {d: self.first_digits.get(d, 0) / total_digits for d in range(1, 10)}
+        mad = sum(abs(actual_dist[d] - BENFORD_EXPECTED[d]) for d in range(1, 10)) / 9.0
+
+        if mad <= 0.006:
+            conformity = "Close Conformity"
+        elif mad <= 0.012:
+            conformity = "Acceptable Conformity"
+        elif mad <= 0.015:
+            conformity = "Marginal Conformity"
+        else:
+            conformity = "Non-Conforming (Potential Anomaly)"
+
+        return {
+            "status": "ANALYZED",
+            "mad": round(mad, 5),
+            "conformity": conformity,
+            "actual_distribution": {d: round(actual_dist[d], 4) for d in range(1, 10)},
+            "expected_distribution": {d: round(BENFORD_EXPECTED[d], 4) for d in range(1, 10)}
+        }
+
+    def _infer_semantic_role(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        pop = stats["populated_count"]
+        card_ratio = stats["cardinality_ratio"]
+        distinct_cnt = stats["distinct_count"]
+        col_name_lower = self.col_name.lower()
+
+        # Regulatory Code: checked first since a validated check-digit match
+        # is the single most certain signal available.
+        if "string_stats" in stats:
+            ss = stats["string_stats"]
+            sample_size = min(pop, 500)
+            if sample_size > 0:
+                for pat_name, shape_cnt in ss["regex_matches"].items():
+                    if (shape_cnt / sample_size) <= 0.75:
+                        continue
+                    has_validator = pat_name in CHECKSUM_VALIDATORS
+                    if has_validator:
+                        checksum_cnt = ss.get("checksum_valid_matches", {}).get(pat_name, 0)
+                        checksum_ratio = (checksum_cnt / shape_cnt) if shape_cnt else 0.0
+                        if checksum_ratio > 0.9:
+                            return {
+                                "role": "Regulatory Code", "subtype": pat_name, "confidence": 0.97,
+                                "reasoning": f"Matches '{pat_name}' format and check-digit validation "
+                                             f"passes on {checksum_ratio * 100:.0f}% of matches."
+                            }
+                        else:
+                            return {
+                                "role": "Regulatory Code", "subtype": pat_name, "confidence": 0.55,
+                                "reasoning": f"Matches '{pat_name}' shape but only {checksum_ratio * 100:.0f}% "
+                                             f"pass check-digit validation -- likely coincidental format "
+                                             f"matches rather than real {pat_name} codes."
+                            }
+                    else:
+                        # No checksum exists for this pattern. CUSIP without a
+                        # passing checksum, and MIC (which has no checksum at
+                        # all), are the weakest of these signals.
+                        confidence = 0.60 if pat_name in ("CUSIP", "MIC") else 0.85
+                        return {
+                            "role": "Regulatory Code", "subtype": pat_name, "confidence": confidence,
+                            "reasoning": f"Matches standard financial pattern '{pat_name}' across "
+                                         f">75% of sample records (shape-only match; no check-digit "
+                                         f"available to confirm)."
+                        }
+
+        # Flag/Indicator: a cheap, highly reliable value-based signal, so it
+        # runs before the keyword-based checks below. Previously a numeric
+        # column named e.g. "tax_rate_flag" with only 2 distinct values
+        # would get caught by the "rate" keyword instead of correctly
+        # falling through to here.
+        val_set = {str(k).lower().strip() for k in self.value_counts.keys() if str(k).strip()}
+        if val_set and (distinct_cnt <= 2 or any(val_set.issubset(b) for b in BOOLEAN_TOKENS)):
+            return {
+                "role": "Flag / Indicator",
+                "subtype": "Boolean Flag",
+                "confidence": 0.98,
+                "reasoning": f"Low distinct value count ({distinct_cnt}) matching binary tokens."
+            }
+
+        if any(w in col_name_lower for w in ["amount", "balance", "price", "notional", "value", "cost", "fee", "pnl", "revenue"]):
+            if "numeric_stats" in stats:
+                return {
+                    "role": "Monetary Amount",
+                    "subtype": "Financial Metric",
+                    "confidence": 0.95,
+                    "reasoning": "Header matches valuation terms and data parses as continuous numeric."
+                }
+
+        if any(w in col_name_lower for w in ["rate", "percentage", "yield", "margin", "ratio", "pct", "bps"]):
+            if "numeric_stats" in stats:
+                return {
+                    "role": "Rate / Percentage",
+                    "subtype": "Financial Rate",
+                    "confidence": 0.92,
+                    "reasoning": "Header suggests rate metric with continuous numeric values."
+                }
+
+        if stats["is_unique"] or (card_ratio > 0.90 and pop > 100):
+            return {
+                "role": "Entity Identifier",
+                "subtype": "Primary Key",
+                "confidence": 0.92,
+                "reasoning": "High cardinality ratio (>0.90) indicating primary key."
+            }
+
+        if "temporal_stats" in stats:
+            return {
+                "role": "Timestamp / Date",
+                "subtype": stats["temporal_stats"]["granularity"],
+                "confidence": 0.99,
+                "reasoning": "Field reliably parses into standard calendar dates."
+            }
+
+        if "numeric_stats" in stats:
+            return {
+                "role": "Numeric Measure",
+                "subtype": "Continuous Variable",
+                "confidence": 0.85,
+                "reasoning": "Numeric distribution without explicit monetary header keywords."
+            }
+
+        if card_ratio < 0.20 or distinct_cnt < 100:
+            return {
+                "role": "Categorical / Enum",
+                "subtype": "Classification Tag",
+                "confidence": 0.88,
+                "reasoning": "Low cardinality ratio with recurring distinct values."
+            }
+
+        return {
+            "role": "Free Text / Narrative",
+            "subtype": "Unstructured String",
+            "confidence": 0.75,
+            "reasoning": "High variability string structure."
+        }
+
+# ---------------------------------------------------------------------------
+# 3. Dynamic Profiler Engine
+# ---------------------------------------------------------------------------
+class GenericFinancialProfiler:
+    def __init__(self, chunksize: int = 50000, skip_rows: int = 0):
+        self.chunksize = chunksize
+        # Number of leading rows to skip before the real header (e.g. report
+        # titles, generation-date banners, blank separator rows that some
+        # export tools prepend before the actual column header row).
+        self.skip_rows = skip_rows
+        # FIX (memory-safety cap): row_hash_counts (used for exact-duplicate
+        # detection) previously grew by one entry per *distinct* row for the
+        # entire file with no ceiling. On a huge, mostly-unique file this is
+        # effectively one Counter entry per row -- tens of millions of
+        # entries -- which combined with per-column distinct-value tracking
+        # was enough to exhaust memory and silently abort ingestion. Once
+        # this cap is hit, brand-new row signatures stop being tracked (so
+        # duplicates introduced only after the cap may be undercounted) but
+        # counts for already-seen rows keep incrementing correctly, and the
+        # file's metadata flags the result as approximate.
+        self.max_tracked_row_hashes = 5_000_000
+
+    def _detect_file_params(self, filepath: str, skip_rows: int = 0) -> Tuple[str, str]:
+        encodings = ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'iso-8859-1']
+        detected_sep = ','
+        detected_enc = 'utf-8'
+
+        for enc in encodings:
+            try:
+                with open(filepath, 'r', encoding=enc, errors='replace') as f:
+                    # FIX (skip-rows aware sniffing): if the file has leading
+                    # banner/metadata rows before the real header, sniffing
+                    # the delimiter from the untouched start of the file can
+                    # detect the wrong separator (or none at all) from that
+                    # junk text. Skip the same rows here that will be
+                    # skipped on the real read, so the sample the sniffer
+                    # sees is the actual header + data.
+                    for _ in range(skip_rows):
+                        if not f.readline():
+                            break
+                    sample = f.read(20000)
+                    if not sample:
+                        continue
+                    try:
+                        dialect = csv.Sniffer().sniff(sample, delimiters=[',', ';', '\t', '|', ':'])
+                        detected_sep = dialect.delimiter
+                        detected_enc = enc
+                        break
+                    except Exception:
+                        counts = {s: sample.count(s) for s in [';', ',', '\t', '|']}
+                        best_sep = max(counts, key=counts.get)
+                        if counts[best_sep] > 0:
+                            detected_sep = best_sep
+                            detected_enc = enc
+                            break
+            except Exception:
+                continue
+        return detected_sep, detected_enc
+
+    def profile_file(self, filepath: str) -> List[Dict[str, Any]]:
+        """Profile a file. Returns a LIST of profile dicts: one entry for
+        CSV/Parquet/single-source files, or one entry PER SHEET for Excel
+        workbooks (previously only the first sheet was ever read, silently
+        dropping every other tab in the workbook)."""
+        ext = os.path.splitext(filepath)[-1].lower()
+        if ext in [".xlsx", ".xls"]:
+            return self._profile_excel_workbook(filepath)
+        return [self._profile_single_source(filepath, ext, source_label=os.path.basename(filepath))]
+
+    def _profile_excel_workbook(self, filepath: str) -> List[Dict[str, Any]]:
+        try:
+            xl = pd.ExcelFile(filepath)
+            sheet_names = xl.sheet_names
+        except Exception as e:
+            return [self._error_profile(filepath, os.path.basename(filepath), f"Failed to open workbook: {e}")]
+
+        base_name = os.path.basename(filepath)
+        results = []
+        for sheet in sheet_names:
+            label = f"{base_name}::{sheet}" if len(sheet_names) > 1 else base_name
+            results.append(self._profile_single_source(filepath, ".xlsx", source_label=label, sheet_name=sheet))
+        return results
+
+    @staticmethod
+    def _error_profile(filepath: str, source_label: str, message: str) -> Dict[str, Any]:
+        return {
+            "file_metadata": {
+                "file_name": source_label,
+                "file_path": filepath,
+                "file_size_bytes": os.path.getsize(filepath) if os.path.exists(filepath) else 0,
+                "total_rows": 0,
+                "total_columns": 0,
+                "duplicate_rows_count": 0,
+                "duplicate_rows_pct": 0.0,
+                "skipped_rows_count": 0,
+                "status": "ERROR",
+                "error_message": message
+            },
+            "columns": [],
+            "cross_column_reconciliation": [],
+            "quality_score": 0.0,
+            "risk_alerts": [{"level": "CRITICAL", "message": message}]
+        }
+
+    def _profile_single_source(
+        self, filepath: str, ext: str, source_label: str, sheet_name: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        accumulators: Dict[str, FinancialColumnAccumulator] = {}
+        total_rows = 0
+        skipped_rows_count = 0
+
+        row_hash_counts = Counter()
+        row_hash_capped = False
+        cross_col_stats = {
+            "date_sequence_checks": [],
+            "additive_checks": [],
+            "conditional_null_checks": []
+        }
+
+        try:
+            if ext in [".csv", ".txt", ".tsv", ".dat"]:
+                sep, enc = self._detect_file_params(filepath, self.skip_rows)
+                # FIX (silent row loss): on_bad_lines='skip' previously
+                # dropped malformed rows with no record of how many, so
+                # total_rows and every downstream percentage were quietly
+                # off. 'warn' keeps the same skip behaviour but the warning
+                # is captured and counted instead of discarded.
+                with warnings.catch_warnings(record=True) as captured:
+                    warnings.simplefilter("always")
+                    reader = pd.read_csv(
+                        filepath, chunksize=self.chunksize, sep=sep, encoding=enc,
+                        low_memory=False, on_bad_lines='warn',
+                        skiprows=self.skip_rows if self.skip_rows else None
+                    )
+                    for chunk in reader:
+                        total_rows += len(chunk)
+                        row_hash_capped = self._process_chunk(chunk, accumulators, row_hash_counts, row_hash_capped)
+                        self._evaluate_cross_column_chunk(chunk, cross_col_stats)
+                    skipped_rows_count = sum(
+                        1 for w in captured if issubclass(w.category, pd.errors.ParserWarning)
+                    )
+            elif ext in [".parquet", ".pq"]:
+                try:
+                    import pyarrow.parquet as pq
+                    parquet_file = pq.ParquetFile(filepath)
+                    for batch in parquet_file.iter_batches(batch_size=self.chunksize):
+                        chunk = batch.to_pandas()
+                        total_rows += len(chunk)
+                        row_hash_capped = self._process_chunk(chunk, accumulators, row_hash_counts, row_hash_capped)
+                        self._evaluate_cross_column_chunk(chunk, cross_col_stats)
+                except ImportError:
+                    df = pd.read_parquet(filepath)
+                    total_rows = len(df)
+                    row_hash_capped = self._process_chunk(df, accumulators, row_hash_counts, row_hash_capped)
+                    self._evaluate_cross_column_chunk(df, cross_col_stats)
+            elif ext in [".xlsx", ".xls"]:
+                df = pd.read_excel(
+                    filepath, sheet_name=sheet_name if sheet_name is not None else 0,
+                    skiprows=self.skip_rows if self.skip_rows else None
+                )
+                total_rows = len(df)
+                for i in range(0, total_rows, self.chunksize):
+                    chunk = df.iloc[i:i + self.chunksize]
+                    row_hash_capped = self._process_chunk(chunk, accumulators, row_hash_counts, row_hash_capped)
+                    self._evaluate_cross_column_chunk(chunk, cross_col_stats)
+            else:
+                raise ValueError(f"Unsupported file extension: {ext}")
+        except Exception as e:
+            return self._error_profile(filepath, source_label, f"Failed to ingest source: {str(e)}")
+
+        duplicate_rows_count = sum(cnt - 1 for cnt in row_hash_counts.values() if cnt > 1)
+        duplicate_rows_pct = round((duplicate_rows_count / total_rows) * 100, 2) if total_rows > 0 else 0.0
+
+        col_profiles = [acc.finalize() for acc in accumulators.values()]
+        reconciliation_summary = self._finalize_cross_column_stats(cross_col_stats, total_rows)
+        quality_score, alerts = self._evaluate_quality_and_risks(
+            col_profiles, total_rows, duplicate_rows_pct, reconciliation_summary, skipped_rows_count
+        )
+
+        if row_hash_capped:
+            alerts.append({
+                "level": "INFO",
+                "message": f"Exact-duplicate detection is approximate beyond "
+                           f"{self.max_tracked_row_hashes:,} distinct row signatures "
+                           f"(memory-safety cap) -- duplicate_rows_count may be a lower bound."
+            })
+
+        return {
+            "file_metadata": {
+                "file_name": source_label,
+                "file_path": filepath,
+                "file_size_bytes": os.path.getsize(filepath),
+                "total_rows": total_rows,
+                "total_columns": len(accumulators),
+                "duplicate_rows_count": duplicate_rows_count,
+                "duplicate_rows_pct": duplicate_rows_pct,
+                "duplicate_detection_capped": row_hash_capped,
+                "skipped_rows_count": skipped_rows_count,
+                "status": "SUCCESS"
+            },
+            "columns": col_profiles,
+            "cross_column_reconciliation": reconciliation_summary,
+            "quality_score": quality_score,
+            "risk_alerts": alerts
+        }
+
+    def _process_chunk(
+        self, chunk: pd.DataFrame, accumulators: Dict[str, FinancialColumnAccumulator],
+        row_hash_counts: Counter, row_hash_capped: bool
+    ) -> bool:
+        # FIX (performance + correctness): the previous approach cast the
+        # whole chunk to strings and MD5-hashed a '|'.join() per row in a
+        # Python-level loop -- slow, and it could treat differently
+        # *formatted* but equal values (e.g. 1.0 vs 1.00) as different rows.
+        # hash_pandas_object hashes the actual values and is vectorized.
+        row_hashes = pd.util.hash_pandas_object(chunk, index=False).tolist()
+
+        # FIX (memory-safety cap): same capping pattern used for per-column
+        # value_counts -- once we've tracked max_tracked_row_hashes distinct
+        # row signatures, stop admitting new ones (avoiding unbounded
+        # growth on a huge, mostly-unique file) but keep incrementing counts
+        # for signatures we already know about, so duplicates of rows seen
+        # before the cap are still counted correctly.
+        if len(row_hash_counts) >= self.max_tracked_row_hashes:
+            row_hash_capped = True
+            counts_this_chunk = Counter(row_hashes)
+            for h, c in counts_this_chunk.items():
+                if h in row_hash_counts:
+                    row_hash_counts[h] += c
+        else:
+            counts_this_chunk = Counter(row_hashes)
+            for h, c in counts_this_chunk.items():
+                if h in row_hash_counts or len(row_hash_counts) < self.max_tracked_row_hashes:
+                    row_hash_counts[h] += c
+
+        for col in chunk.columns:
+            col_str = str(col)
+            if col_str not in accumulators:
+                accumulators[col_str] = FinancialColumnAccumulator(col_str)
+            accumulators[col_str].update(chunk[col])
+
+        return row_hash_capped
+
+    def _evaluate_cross_column_chunk(self, chunk: pd.DataFrame, stats: Dict[str, Any]):
+        cols_lower = {str(c).lower().strip(): c for c in chunk.columns}
+
+        date_pairs = [
+            ("start_date", "end_date"), ("effective_date", "expiration_date"),
+            ("trade_date", "settlement_date"), ("issue_date", "maturity_date"),
+            ("created_at", "updated_at")
+        ]
+        for start_key, end_key in date_pairs:
+            matched_start = [v for k, v in cols_lower.items() if start_key in k]
+            matched_end = [v for k, v in cols_lower.items() if end_key in k]
+            if matched_start and matched_end:
+                s_col, e_col = matched_start[0], matched_end[0]
+                d_start = pd.to_datetime(chunk[s_col], errors='coerce', format='mixed', utc=True)
+                d_end = pd.to_datetime(chunk[e_col], errors='coerce', format='mixed', utc=True)
+                valid_mask = d_start.notna() & d_end.notna()
+                if valid_mask.any():
+                    violations = int((d_start[valid_mask] > d_end[valid_mask]).sum())
+                    stats["date_sequence_checks"].append({
+                        "check_name": f"Temporal Sequence ({s_col} <= {e_col})",
+                        "tested_count": int(valid_mask.sum()),
+                        "violation_count": violations
+                    })
+
+        if "net_amount" in cols_lower and "tax_amount" in cols_lower and "gross_amount" in cols_lower:
+            c_net, c_tax, c_gross = cols_lower["net_amount"], cols_lower["tax_amount"], cols_lower["gross_amount"]
+            net_v = pd.to_numeric(chunk[c_net], errors='coerce')
+            tax_v = pd.to_numeric(chunk[c_tax], errors='coerce')
+            gross_v = pd.to_numeric(chunk[c_gross], errors='coerce')
+            valid_m = net_v.notna() & tax_v.notna() & gross_v.notna()
+            if valid_m.any():
+                diff = (net_v[valid_m] + tax_v[valid_m]) - gross_v[valid_m]
+                violations = int((diff.abs() > 0.01).sum())
+                stats["additive_checks"].append({
+                    "check_name": f"Additive Equivalence ({c_net} + {c_tax} == {c_gross})",
+                    "tested_count": int(valid_m.sum()),
+                    "violation_count": violations
+                })
+
+    def _finalize_cross_column_stats(self, stats: Dict[str, Any], total_rows: int) -> List[Dict[str, Any]]:
+        results = []
+        date_combined = Counter()
+        date_tested = Counter()
+        for item in stats["date_sequence_checks"]:
+            name = item["check_name"]
+            date_combined[name] += item["violation_count"]
+            date_tested[name] += item["tested_count"]
+
+        for name, viol in date_combined.items():
+            t_cnt = date_tested[name]
+            pct = round((viol / t_cnt) * 100, 2) if t_cnt > 0 else 0.0
+            results.append({
+                "check_category": "Temporal Logic Check",
+                "check_name": name,
+                "tested_records": t_cnt,
+                "violations_count": viol,
+                "violation_pct": pct,
+                "status": "PASSED" if viol == 0 else "FAILED"
+            })
+
+        add_combined = Counter()
+        add_tested = Counter()
+        for item in stats["additive_checks"]:
+            name = item["check_name"]
+            add_combined[name] += item["violation_count"]
+            add_tested[name] += item["tested_count"]
+
+        for name, viol in add_combined.items():
+            t_cnt = add_tested[name]
+            pct = round((viol / t_cnt) * 100, 2) if t_cnt > 0 else 0.0
+            results.append({
+                "check_category": "Additive Accounting Check",
+                "check_name": name,
+                "tested_records": t_cnt,
+                "violations_count": viol,
+                "violation_pct": pct,
+                "status": "PASSED" if viol == 0 else "FAILED"
+            })
+
+        return results
+
+    def _evaluate_quality_and_risks(
+        self, columns: List[Dict[str, Any]], total_rows: int, dup_pct: float,
+        recon_results: List[Dict[str, Any]], skipped_rows_count: int = 0
+    ) -> Tuple[float, List[Dict[str, str]]]:
+        if not columns or total_rows == 0:
+            return 0.0, [{"level": "CRITICAL", "message": "Dataset is completely empty or unreadable."}]
+
+        score = 100.0
+        alerts = []
+
+        if dup_pct > 0:
+            penalty = min(25.0, dup_pct * 1.5)
+            score -= penalty
+            alerts.append({"level": "WARNING" if dup_pct < 5.0 else "RISK", "message": f"Dataset contains {dup_pct}% exact duplicate rows."})
+
+        if skipped_rows_count > 0:
+            denom = total_rows + skipped_rows_count
+            skipped_pct = round((skipped_rows_count / denom) * 100, 2) if denom > 0 else 0.0
+            score -= min(10.0, skipped_pct * 2)
+            alerts.append({
+                "level": "WARNING",
+                "message": f"{skipped_rows_count} malformed row(s) were skipped during ingestion "
+                           f"(~{skipped_pct}% of source rows) and are excluded from every stat."
+            })
+
+        for check in recon_results:
+            if check["status"] == "FAILED":
+                score -= min(15.0, check["violation_pct"])
+                alerts.append({
+                    "level": "RISK",
+                    "message": f"Cross-Column Failure: '{check['check_name']}' failed on {check['violations_count']} records ({check['violation_pct']}%)."
+                })
+
+        for col in columns:
+            cname = col["field_name"]
+            null_pct = col["null_pct"]
+
+            # FIX (dropped-junk bug): surface non-conforming values (e.g.
+            # "PENDING"/"N/A" inside an amount or date column) as their own
+            # alert. Previously these were counted in populated_count and
+            # value_counts but nowhere else, so they never tripped any
+            # quality signal -- even when the column's overall type_
+            # consistency still read CONSISTENT (85% numeric clears the 80%
+            # bar even with 15% junk mixed in).
+            non_conforming_count = col.get("non_conforming_count", 0)
+            if non_conforming_count > 0:
+                non_conforming_pct = col.get("non_conforming_pct", 0.0)
+                samples = col.get("non_conforming_samples", [])
+                sample_str = ", ".join(f"'{s['value']}'" for s in samples[:5])
+                score -= min(10.0, non_conforming_pct * 2)
+                alerts.append({
+                    "level": "RISK" if non_conforming_pct >= 1.0 else "WARNING",
+                    "message": f"Field '{cname}' contains {non_conforming_count} value(s) "
+                               f"({non_conforming_pct}%) that don't match the field's dominant type "
+                               f"(e.g. {sample_str}) -- included in populated_count but excluded from "
+                               f"numeric/date statistics."
+                })
+
+            if null_pct > 30:
+                score -= min(20, null_pct / 2)
+                alerts.append({"level": "WARNING", "message": f"Field '{cname}' has elevated missing values ({null_pct}%)."})
+            if col["is_constant"]:
+                score -= 3
+                alerts.append({"level": "INFO", "message": f"Field '{cname}' is constant (1 distinct value)."})
+            if col.get("type_consistency") == "MIXED":
+                score -= 8
+                breakdown = col.get("type_breakdown_pct", {})
+                alerts.append({
+                    "level": "RISK",
+                    "message": f"Field '{cname}' has inconsistent typing across the file "
+                               f"(breakdown: {breakdown}) -- possible schema drift or a genuinely mixed-type column."
+                })
+            if col.get("distinct_count_is_lower_bound"):
+                alerts.append({
+                    "level": "INFO",
+                    "message": f"Field '{cname}' exceeded {5_000_000:,} distinct values; "
+                               f"distinct_count/cardinality_ratio/is_unique are reported as lower "
+                               f"bounds (memory-safety cap) rather than exact."
+                })
+            if "numeric_stats" in col:
+                if col["numeric_stats"].get("infinite_count", 0) > 0:
+                    alerts.append({
+                        "level": "WARNING",
+                        "message": f"Field '{cname}' contains {col['numeric_stats']['infinite_count']} "
+                                   f"infinite value(s) excluded from its statistics."
+                    })
+                benford = col["numeric_stats"].get("benford_analysis", {})
+                if benford.get("conformity") == "Non-Conforming (Potential Anomaly)":
+                    score -= 5
+                    alerts.append({
+                        "level": "RISK",
+                        "message": f"Forensic Alert: Numeric field '{cname}' deviates from Benford's Law (MAD: {benford.get('mad')})."
+                    })
+
+        return max(0.0, round(score, 1)), alerts
+
+# ---------------------------------------------------------------------------
+# 4. Modern Interactive Studio UI Generator
+# ---------------------------------------------------------------------------
+class FinancialDashboardGenerator:
+    @classmethod
+    def generate_dashboard(cls, profiles: List[Dict[str, Any]], json_out_path: str, html_out_path: str):
+        master_report = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_files": len(profiles),
+            "files": profiles
+        }
+        with open(json_out_path, "w", encoding="utf-8") as f:
+            json.dump(master_report, f, indent=2, default=str)
+        print(f"-> Unified Master JSON saved: {json_out_path}")
+
+        # FIX (blank-dashboard bug): the master report is embedded verbatim
+        # inside a <script> tag. If ANY string value anywhere in the data
+        # (a free-text field, a non-conforming sample, a filename) happens
+        # to contain the literal substring "</script", the browser's HTML
+        # parser closes the script tag right there -- before the rest of
+        # the JSON and all of the dashboard's own JS. Everything after that
+        # point is dropped, `init()` never runs, and the page renders as
+        # blank/empty even though the JSON file on disk is completely
+        # correct. Escaping "</" as "<\/" (a no-op inside a JS string/JSON
+        # value, but no longer matches the closing-tag sequence) prevents
+        # this without changing the parsed data at all. `default=str` is a
+        # defensive catch-all for any stray non-JSON-native type (e.g. a
+        # pandas/numpy scalar that slipped through) so one bad value can't
+        # throw and abort dashboard generation entirely.
+        json_data_str = json.dumps(master_report, default=str).replace("</", "<\\/")
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Quality & Forensic Studio</title>
+    <style>
+        :root {{
+            --bg-dark: #0b132b;
+            --panel-bg: #1c2541;
+            --card-bg: #111827;
+            --border-color: #3a506b;
+            --accent-blue: #3a86ff;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }}
+        .top-navbar {{
+            height: 60px;
+            background: #1c2541;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+        }}
+        .top-navbar h1 {{ font-size: 19px; font-weight: 700; letter-spacing: 0.5px; color: #ffffff; }}
+        .top-navbar .meta {{ font-size: 12px; color: var(--text-muted); background: #0b132b; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border-color); }}
+
+        .app-container {{ display: flex; flex: 1; overflow: hidden; }}
+
+        /* Panel 1: File List */
+        .panel-files {{ width: 320px; background: #1c2541; border-right: 1px solid var(--border-color); display: flex; flex-direction: column; }}
+        .panel-header {{ padding: 14px 16px; border-bottom: 1px solid var(--border-color); font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--text-muted); letter-spacing: 1px; }}
+        .search-input {{ width: calc(100% - 24px); margin: 12px; padding: 10px 14px; background: #0b132b; border: 1px solid var(--border-color); border-radius: 6px; color: white; font-size: 13px; outline: none; }}
+        .file-list {{ flex: 1; overflow-y: auto; }}
+        .file-item {{ padding: 14px 16px; border-bottom: 1px solid var(--border-color); cursor: pointer; transition: background 0.15s; }}
+        .file-item:hover {{ background: #3a506b; }}
+        .file-item.active {{ background: #2563eb !important; color: white; }}
+        .file-item-name {{ font-size: 14px; font-weight: 600; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .file-item-sub {{ font-size: 11px; opacity: 0.85; display: flex; justify-content: space-between; }}
+
+        /* Panel 2: Column Selection */
+        .panel-columns {{ width: 320px; background: #111827; border-right: 1px solid var(--border-color); display: flex; flex-direction: column; }}
+        .column-list {{ flex: 1; overflow-y: auto; }}
+        .column-item {{ padding: 12px 16px; border-bottom: 1px solid #1f2937; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }}
+        .column-item:hover {{ background: #1f2937; }}
+        .column-item.active {{ background: #1d4ed8; }}
+        .col-title {{ font-size: 13px; font-weight: 600; color: #f3f4f6; }}
+
+        /* Panel 3: Inspector */
+        .panel-inspector {{ flex: 1; background: #0b132b; overflow-y: auto; padding: 24px; }}
+        .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; color: white; text-transform: uppercase; }}
+
+        .stat-card-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+        .card {{ background: #1c2541; border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; }}
+        .card .lbl {{ font-size: 11px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px; }}
+        .card .val {{ font-size: 20px; font-weight: 700; color: #ffffff; }}
+
+        .section-title {{ font-size: 15px; font-weight: 700; margin: 24px 0 12px 0; color: #ffffff; border-bottom: 1px solid var(--border-color); padding-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }}
+
+        /* Time Grain Controls */
+        .grain-controls {{ display: flex; gap: 8px; background: #111827; padding: 4px; border-radius: 6px; border: 1px solid var(--border-color); }}
+        .grain-btn {{ padding: 6px 12px; font-size: 11px; font-weight: 600; background: transparent; border: none; color: var(--text-muted); border-radius: 4px; cursor: pointer; }}
+        .grain-btn.active {{ background: var(--accent-blue); color: white; }}
+
+        table {{ width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; margin-bottom: 20px; }}
+        th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border-color); }}
+        th {{ background: #1c2541; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
+
+        .progress-bar-bg {{ background: #0b132b; height: 8px; border-radius: 4px; overflow: hidden; width: 100%; border: 1px solid var(--border-color); }}
+        .progress-bar-fill {{ background: var(--accent-blue); height: 100%; }}
+
+        .empty-state {{ text-align: center; color: var(--text-muted); margin-top: 100px; font-size: 15px; }}
+    </style>
+</head>
+<body>
+    <div class="top-navbar">
+        <h1>Data Quality & Forensic Studio</h1>
+        <div class="meta" id="headerMeta">Master Profile Dashboard</div>
+    </div>
+
+    <div class="app-container">
+        <!-- Panel 1: File List -->
+        <div class="panel-files">
+            <div class="panel-header">Audited Datasets</div>
+            <input type="text" id="fileSearch" class="search-input" placeholder="Search files..." oninput="renderFileList()">
+            <div class="file-list" id="fileList"></div>
+        </div>
+
+        <!-- Panel 2: Column Selection -->
+        <div class="panel-columns">
+            <div class="panel-header" id="colPanelHeader">Columns</div>
+            <input type="text" id="colSearch" class="search-input" placeholder="Filter columns..." oninput="renderColumnList()">
+            <div class="column-list" id="columnList"></div>
+        </div>
+
+        <!-- Panel 3: In-Depth Inspector -->
+        <div class="panel-inspector" id="inspectorPanel">
+            <div class="empty-state">Select a dataset and column to inspect temporal and statistical metrics.</div>
+        </div>
+    </div>
+
+    <script>
+        const MASTER_DATA = {json_data_str};
+        let activeFileIdx = null;
+        let activeColIdx = null;
+        let activeTimeGrain = 'monthly'; // Options: yearly, halfyearly, quarterly, monthly
+
+        const ROLE_COLORS = {{
+            "Entity Identifier": "#2563eb",
+            "Regulatory Code": "#7c3aed",
+            "Monetary Amount": "#059669",
+            "Rate / Percentage": "#10b981",
+            "Categorical / Enum": "#d97706",
+            "Timestamp / Date": "#db2777",
+            "Flag / Indicator": "#0891b2",
+            "Numeric Measure": "#6366f1",
+            "Free Text / Narrative": "#64748b"
+        }};
+
+        function init() {{
+            document.getElementById('headerMeta').innerText = `Generated: ${{MASTER_DATA.generated_at}} | Total Files: ${{MASTER_DATA.total_files}}`;
+            renderFileList();
+            if (MASTER_DATA.files.length > 0) {{
+                selectFile(0);
+            }}
+        }}
+
+        function renderFileList() {{
+            const query = document.getElementById('fileSearch').value.toLowerCase();
+            const listEl = document.getElementById('fileList');
+            listEl.innerHTML = '';
+
+            MASTER_DATA.files.forEach((f, idx) => {{
+                const meta = f.file_metadata;
+                if (meta.file_name.toLowerCase().includes(query)) {{
+                    const item = document.createElement('div');
+                    item.className = `file-item ${{activeFileIdx === idx ? 'active' : ''}}`;
+                    item.onclick = () => selectFile(idx);
+                    item.innerHTML = `
+                        <div class="file-item-name">${{meta.file_name}}</div>
+                        <div class="file-item-sub">
+                            <span>${{meta.total_rows.toLocaleString()}} rows</span>
+                            <span style="font-weight:bold; color:${{f.quality_score > 80 ? '#34d399' : '#f87171'}}">${{f.quality_score}}% Health</span>
+                        </div>
+                    `;
+                    listEl.appendChild(item);
+                }}
+            }});
+        }}
+
+        function selectFile(idx) {{
+            activeFileIdx = idx;
+            activeColIdx = null;
+            renderFileList();
+
+            const fileObj = MASTER_DATA.files[idx];
+            document.getElementById('colPanelHeader').innerText = `Columns (${{fileObj.columns.length}})`;
+            renderColumnList();
+
+            if (fileObj.columns.length > 0) {{
+                selectColumn(0);
+            }} else {{
+                renderFileOverviewOnly();
+            }}
+        }}
+
+        function renderColumnList() {{
+            if (activeFileIdx === null) return;
+            const query = document.getElementById('colSearch').value.toLowerCase();
+            const columns = MASTER_DATA.files[activeFileIdx].columns;
+            const listEl = document.getElementById('columnList');
+            listEl.innerHTML = '';
+
+            columns.forEach((c, idx) => {{
+                if (c.field_name.toLowerCase().includes(query) || c.semantic_role.role.toLowerCase().includes(query)) {{
+                    const role = c.semantic_role.role;
+                    const color = ROLE_COLORS[role] || '#64748b';
+                    const item = document.createElement('div');
+                    item.className = `column-item ${{activeColIdx === idx ? 'active' : ''}}`;
+                    item.onclick = () => selectColumn(idx);
+                    item.innerHTML = `
+                        <div>
+                            <div class="col-title">${{c.field_name}}</div>
+                            <div style="font-size:11px; color:#9ca3af;">${{c.detected_dtype}}</div>
+                        </div>
+                        <span class="badge" style="background:${{color}}">${{role}}</span>
+                    `;
+                    listEl.appendChild(item);
+                }}
+            }});
+        }}
+
+        function selectColumn(idx) {{
+            activeColIdx = idx;
+            renderColumnList();
+            renderInspector();
+        }}
+
+        function setTimeGrain(grain) {{
+            activeTimeGrain = grain;
+            renderInspector();
+        }}
+
+        function renderFileOverviewOnly() {{
+            const fileObj = MASTER_DATA.files[activeFileIdx];
+            const meta = fileObj.file_metadata;
+            let bodyHtml = `
+                <h2 style="font-size:24px; color:#fff; margin-bottom:16px;">${{meta.file_name}} Overview</h2>
+                <div class="stat-card-grid">
+                    <div class="card"><div class="lbl">Total Rows</div><div class="val">${{meta.total_rows.toLocaleString()}}</div></div>
+                    <div class="card"><div class="lbl">Duplicate Rows</div><div class="val" style="color:${{meta.duplicate_rows_count > 0 ? '#f87171' : '#fff'}}">${{meta.duplicate_rows_count.toLocaleString()}} (${{meta.duplicate_rows_pct}}%)</div></div>
+                    <div class="card"><div class="lbl">Quality Score</div><div class="val" style="color:${{fileObj.quality_score > 80 ? '#34d399' : '#f87171'}}">${{fileObj.quality_score}}%</div></div>
+                </div>
+            `;
+            if (meta.status === 'ERROR') {{
+                bodyHtml += `<div class="card" style="border-left:4px solid #ef4444; margin-top:16px;">
+                    <div class="lbl">Ingestion Error</div>
+                    <div style="color:#fca5a5; font-size:13px;">${{meta.error_message || 'Unknown error'}}</div>
+                </div>`;
+            }}
+            document.getElementById('inspectorPanel').innerHTML = bodyHtml;
+        }}
+
+        function renderInspector() {{
+            if (activeFileIdx === null || activeColIdx === null) return;
+            const fileObj = MASTER_DATA.files[activeFileIdx];
+            const meta = fileObj.file_metadata;
+            const col = fileObj.columns[activeColIdx];
+            const inspector = document.getElementById('inspectorPanel');
+            const role = col.semantic_role;
+            const roleColor = ROLE_COLORS[role.role] || '#64748b';
+
+            let bodyHtml = `
+                <!-- File Overhead Metadata Summary -->
+                <div style="background:#1c2541; padding:12px 16px; border-radius:8px; margin-bottom:20px; border:1px solid #3a506b; display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <span style="font-size:12px; color:#94a3b8;">ACTIVE FILE:</span>
+                        <strong style="color:#fff; font-size:14px; margin-left:6px;">${{meta.file_name}}</strong>
+                    </div>
+                    <div style="font-size:12px;">
+                        Exact Duplicates: <b style="color:${{meta.duplicate_rows_count > 0 ? '#f87171' : '#34d399'}}">${{meta.duplicate_rows_count.toLocaleString()}} (${{meta.duplicate_rows_pct}}%)</b>
+                    </div>
+                </div>
+
+                <!-- Column Header -->
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:20px;">
+                    <div>
+                        <h2 style="font-size:24px; color:#fff;">${{col.field_name}}</h2>
+                        <div style="font-size:13px; color:#94a3b8; margin-top:4px;">
+                            Dtype: <b>${{col.detected_dtype}}</b> | Semantic Subtype: <b>${{role.subtype}}</b>
+                        </div>
+                    </div>
+                    <span class="badge" style="background:${{roleColor}}; font-size:12px; padding:6px 12px;">${{role.role}}</span>
+                </div>
+
+                <div class="card" style="margin-bottom:20px; border-left:4px solid ${{roleColor}};">
+                    <div class="lbl">Semantic Decision Reasoning</div>
+                    <div style="font-size:13px; color:#cbd5e1;">${{role.reasoning}} (Confidence: ${{(role.confidence * 100).toFixed(0)}}%)</div>
+                </div>
+
+                <div class="stat-card-grid">
+                    <div class="card">
+                        <div class="lbl">Populated Rate</div>
+                        <div class="val">${{col.populated_pct}}%</div>
+                        <div style="font-size:11px; color:#94a3b8; margin-top:4px;">${{col.populated_count.toLocaleString()}} / ${{col.total_rows.toLocaleString()}}</div>
+                    </div>
+                    <div class="card">
+                        <div class="lbl">Null / Empty Count</div>
+                        <div class="val" style="color:${{col.null_count > 0 ? '#f87171' : '#fff'}}">${{col.null_count.toLocaleString()}}</div>
+                        <div style="font-size:11px; color:#94a3b8; margin-top:4px;">${{col.null_pct}}% missing</div>
+                    </div>
+                    <div class="card">
+                        <div class="lbl">Distinct Values</div>
+                        <div class="val">${{col.distinct_count_is_lower_bound ? '&ge;' : ''}}${{col.distinct_count.toLocaleString()}}</div>
+                        <div style="font-size:11px; color:#94a3b8; margin-top:4px;">Card. Ratio: ${{col.cardinality_ratio}}</div>
+                    </div>
+                    <div class="card">
+                        <div class="lbl">Uniqueness Flag</div>
+                        <div class="val" style="font-size:16px;">${{col.is_unique ? 'UNIQUE KEY' : (col.is_constant ? 'CONSTANT' : 'RECURRING')}}</div>
+                    </div>
+                </div>
+            `;
+
+            // Cross-Column Reconciliation Checks
+            if (fileObj.cross_column_reconciliation && fileObj.cross_column_reconciliation.length > 0) {{
+                bodyHtml += `
+                    <div class="section-title">Cross-Column Reconciliation Integrity</div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Category</th>
+                                <th>Check Description</th>
+                                <th>Tested Records</th>
+                                <th>Violations</th>
+                                <th>Violation Rate</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${{fileObj.cross_column_reconciliation.map(r => `
+                                <tr>
+                                    <td><b>${{r.check_category}}</b></td>
+                                    <td>${{r.check_name}}</td>
+                                    <td>${{r.tested_records.toLocaleString()}}</td>
+                                    <td style="color:${{r.violations_count > 0 ? '#f87171' : '#fff'}}">${{r.violations_count.toLocaleString()}}</td>
+                                    <td>${{r.violation_pct}}%</td>
+                                    <td><span class="badge" style="background:${{r.status === 'PASSED' ? '#059669' : '#dc2626'}}">${{r.status}}</span></td>
+                                </tr>
+                            `).join('')}}
+                        </tbody>
+                    </table>
+                `;
+            }}
+
+            // Temporal Multi-Grain Analysis
+            if (col.temporal_stats) {{
+                const t = col.temporal_stats;
+                let grainDist = {{}};
+                if (activeTimeGrain === 'yearly') grainDist = t.yearly_distribution || {{}};
+                else if (activeTimeGrain === 'halfyearly') grainDist = t.halfyearly_distribution || {{}};
+                else if (activeTimeGrain === 'quarterly') grainDist = t.quarterly_distribution || {{}};
+                else grainDist = t.monthly_distribution || {{}};
+
+                const totalPeriodCount = Object.values(grainDist).reduce((a, b) => a + b, 0);
+
+                bodyHtml += `
+                    <div class="section-title">
+                        <span>Temporal Profile & Age Slicing</span>
+                        <div class="grain-controls">
+                            <button class="grain-btn ${{activeTimeGrain === 'yearly' ? 'active' : ''}}" onclick="setTimeGrain('yearly')">Yearly</button>
+                            <button class="grain-btn ${{activeTimeGrain === 'halfyearly' ? 'active' : ''}}" onclick="setTimeGrain('halfyearly')">Half-Yearly</button>
+                            <button class="grain-btn ${{activeTimeGrain === 'quarterly' ? 'active' : ''}}" onclick="setTimeGrain('quarterly')">Quarterly</button>
+                            <button class="grain-btn ${{activeTimeGrain === 'monthly' ? 'active' : ''}}" onclick="setTimeGrain('monthly')">Monthly</button>
+                        </div>
+                    </div>
+
+                    <div class="stat-card-grid">
+                        <div class="card"><div class="lbl">Min Date</div><div class="val" style="font-size:16px;">${{t.min_date.substring(0,19)}}</div></div>
+                        <div class="card"><div class="lbl">Max Date</div><div class="val" style="font-size:16px;">${{t.max_date.substring(0,19)}}</div></div>
+                        <div class="card"><div class="lbl">Time Span</div><div class="val">${{t.span_days}} Days</div></div>
+                        <div class="card"><div class="lbl">Future Dated Count</div><div class="val">${{t.future_dated_count}}</div></div>
+                    </div>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Period (${{activeTimeGrain.toUpperCase()}})</th>
+                                <th>Record Volume</th>
+                                <th>Share (%)</th>
+                                <th style="width:40%;">Volume Spectrum</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${{Object.entries(grainDist).map(([period, cnt]) => {{
+                                const pct = totalPeriodCount > 0 ? ((cnt / totalPeriodCount) * 100).toFixed(2) : 0;
+                                return `
+                                    <tr>
+                                        <td><b>${{period}}</b></td>
+                                        <td>${{cnt.toLocaleString()}}</td>
+                                        <td>${{pct}}%</td>
+                                        <td>
+                                            <div class="progress-bar-bg">
+                                                <div class="progress-bar-fill" style="width:${{pct}}%; background:${{roleColor}};"></div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                `;
+                            }}).join('')}}
+                        </tbody>
+                    </table>
+                `;
+            }}
+
+            // Numeric Moments
+            if (col.numeric_stats) {{
+                const num = col.numeric_stats;
+                const p = num.percentiles;
+                bodyHtml += `
+                    <div class="section-title">Numeric Distribution & Moments</div>
+                    <div class="stat-card-grid">
+                        <div class="card"><div class="lbl">Min</div><div class="val">${{num.min.toLocaleString()}}</div></div>
+                        <div class="card"><div class="lbl">Max</div><div class="val">${{num.max.toLocaleString()}}</div></div>
+                        <div class="card"><div class="lbl">Mean</div><div class="val">${{num.mean.toLocaleString()}}</div></div>
+                        <div class="card"><div class="lbl">Std Dev</div><div class="val">±${{num.std_dev.toLocaleString()}}</div></div>
+                        <div class="card"><div class="lbl">Skewness</div><div class="val">${{num.skewness}}</div></div>
+                        <div class="card"><div class="lbl">Zeroes / Negatives</div><div class="val">${{num.zero_count}} / ${{num.negative_count}}</div></div>
+                    </div>
+
+                    <div class="section-title">Percentile Spectrum</div>
+                    <table>
+                        <thead>
+                            <tr><th>p1</th><th>p5</th><th>p10</th><th>p25</th><th>p50 (Median)</th><th>p75</th><th>p90</th><th>p95</th><th>p99</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>${{p.p1}}</td><td>${{p.p5}}</td><td>${{p.p10}}</td>
+                                <td>${{p.p25}}</td><td style="color:#60a5fa; font-weight:bold;">${{p.p50}}</td><td>${{p.p75}}</td>
+                                <td>${{p.p90}}</td><td>${{p.p95}}</td><td>${{p.p99}}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                `;
+
+                if (num.benford_analysis && num.benford_analysis.status === 'ANALYZED') {{
+                    const b = num.benford_analysis;
+                    bodyHtml += `
+                        <div class="section-title">Forensic Benford's Law Analysis</div>
+                        <div class="card" style="margin-bottom:12px;">
+                            <div class="lbl">Conformity Rating</div>
+                            <div class="val" style="font-size:18px; color:${{b.conformity.includes('Non') ? '#f87171' : '#34d399'}}">${{b.conformity}} (MAD: ${{b.mad}})</div>
+                        </div>
+                    `;
+                }}
+            }}
+
+            // Frequency Table
+            if (col.frequency_distribution && col.frequency_distribution.length > 0) {{
+                bodyHtml += `
+                    <div class="section-title">Top Value Frequency Distribution</div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Value</th>
+                                <th>Occurrences</th>
+                                <th>Percentage</th>
+                                <th style="width:40%;">Visual Spectrum</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${{col.frequency_distribution.map(f => `
+                                <tr>
+                                    <td style="font-family:monospace; font-weight:bold;">'${{f.value}}'</td>
+                                    <td>${{f.count.toLocaleString()}}</td>
+                                    <td>${{f.percentage}}%</td>
+                                    <td>
+                                        <div class="progress-bar-bg">
+                                            <div class="progress-bar-fill" style="width:${{f.percentage}}%; background:${{roleColor}};"></div>
+                                        </div>
+                                    </td>
+                                </tr>
+                            `).join('')}}
+                        </tbody>
+                    </table>
+                `;
+            }}
+
+            inspector.innerHTML = bodyHtml;
+        }}
+
+        window.onload = init;
+    </script>
+</body>
+</html>"""
+
+        with open(html_out_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        print(f"-> Interactive HTML Dashboard saved: {html_out_path}")
+
+# ---------------------------------------------------------------------------
+# 5. Runner
+# ---------------------------------------------------------------------------
+def run_financial_profiler(
+    inputs: Union[str, List[str]],
+    json_path: str = "master_financial_profile.json",
+    html_path: str = "financial_analytics_studio.html",
+    skip_rows: int = 0,
+):
+    """
+    skip_rows: number of leading rows to skip in each CSV/Excel source before
+    the real header row (e.g. report banners/metadata rows some exports
+    prepend). Applied uniformly to every CSV/TXT/TSV/DAT and Excel file in
+    this run; has no effect on Parquet sources.
+    """
+    file_list = []
+
+    if isinstance(inputs, str):
+        if os.path.isdir(inputs):
+            for root, _, files in os.walk(inputs):
+                for f in files:
+                    if not f.startswith("~") and not f.startswith("."):
+                        ext = os.path.splitext(f)[-1].lower()
+                        if ext in [".csv", ".tsv", ".parquet", ".pq", ".xlsx", ".xls", ".dat", ".txt"]:
+                            file_list.append(os.path.join(root, f))
+        elif os.path.isfile(inputs):
+            file_list.append(inputs)
+        else:
+            file_list = glob.glob(inputs)
+    elif isinstance(inputs, list):
+        file_list = inputs
+
+    print(f"=== Running Profiler on {len(file_list)} File(s) ===")
+
+    profiler = GenericFinancialProfiler(chunksize=50000, skip_rows=skip_rows)
+    all_profiles = []
+    for filepath in file_list:
+        print(f"Ingesting: {os.path.basename(filepath)}...")
+        # FIX: profile_file now returns a list (1 entry normally, 1 per
+        # sheet for multi-sheet Excel workbooks), so extend rather than
+        # append.
+        profiles = profiler.profile_file(filepath)
+        for p in profiles:
+            # FIX (silent failure visibility): a caught ingestion exception
+            # (e.g. OOM on a huge high-cardinality file, bad encoding, etc.)
+            # previously only showed up buried in the file's risk_alerts
+            # inside the JSON/HTML. Printing it immediately means a "blank"
+            # or empty-looking dashboard has an obvious cause in the console
+            # instead of requiring a dig through the output files.
+            if p["file_metadata"]["status"] == "ERROR":
+                print(f"  !! ERROR profiling {p['file_metadata']['file_name']}: "
+                      f"{p['file_metadata'].get('error_message')}")
+        all_profiles.extend(profiles)
+
+    FinancialDashboardGenerator.generate_dashboard(all_profiles, json_path, html_path)
+    print("=== Profiling Complete ===")
+
+
+if __name__ == "__main__":
+    # Example usage:
+    # run_financial_profiler("my_data_folder/", "master_profile.json", "studio.html", skip_rows=3)
+    pass
