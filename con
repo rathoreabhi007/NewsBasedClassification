@@ -1,0 +1,308 @@
+# Control Config Workbook — Reference Schema (v2)
+
+> Source example: `CFTC_Trade-State-Comp_CO.xlsx`
+> Regulation: CFTC-P45 | Control: Trade-State-Comp | Asset Class: CO (Commodities)
+> Purpose: a structural + behavioral reference so an LLM (or a human) can generate a **new** control-config workbook for a different regulation/asset class, reusing everything that's boilerplate and clearly flagging everything that needs a subject-matter-expert decision.
+
+**Provenance / confidence note:** this doc was reconstructed from photographs of an existing workbook, not the raw file. Sheet structure, column headers, and naming conventions were legible and are high-confidence. Individual formula syntax (exact operators, quoting, null handling) was partially illegible and is a **best-effort reconstruction** — treat §7's formula grammar as provisional until confirmed against a real `.xlsx`. See §9 Changelog.
+
+---
+
+## 1. What this workbook is
+
+A single-control config is a multi-sheet Excel workbook that fully specifies:
+1. Where the **source (SRC)** trade data lives and how to read it
+2. Where the **target/regulatory-report (TGT)** data lives and how to read it
+3. How raw fields on each side are renamed/transformed into a common internal field set
+4. What external reference data is joined in (**Enrichments**)
+5. Which trades are **eligible** to be in scope for the regulation
+6. Which counterparty/entity is **obligated** to report
+7. How SRC and TGT records are **reconciled** (paired, matched, broken)
+8. How breaks are **explained** (root-cause classification)
+
+Each control = one workbook. Multiple controls exist per regulation (e.g. one per asset class), so the pattern must be **parameterized by Regulation + AssetClass**, everything else follows the template.
+
+---
+
+## 2. Pipeline flow (sheet order = data flow)
+
+```mermaid
+flowchart TD
+    CD[ControlDetails\ncontrol metadata]
+
+    subgraph SRC_SIDE[Source side]
+        IF[InputFiles\nwhere/how to read SRC files]
+        FM[FieldMappings\nSRC raw field -> SRC_ field]
+    end
+
+    subgraph TGT_SIDE[Target / regulator report side]
+        IFT[InputFiles_TGT\nwhere/how to read TGT files]
+        FMT[FieldMappings_TGT\nTGT raw field -> TGT_ field]
+    end
+
+    EN[Enrichments\nlookup/reference joins onto SRC]
+    ENT[Enrichments_TGT\nlookup/reference joins onto TGT]
+    ENTFPR[EnrichmentsTGT_FinalPostRec\npost-recon enrichments, e.g. NACK/valuation status]
+
+    ELIG[Eligibility\n_CTRL rules: is this trade in scope?]
+    OBLIG[Obligation\n_CTRL rules: who must report it?]
+    REC[RecRules\nSRC vs TGT pairing + reconciliation status]
+    BE[BreakExplain\n_CTRL_EXP rules: classify/explain the break]
+
+    CD --> IF --> FM --> EN
+    CD --> IFT --> FMT --> ENT
+    ENT --> ENTFPR
+    EN --> ELIG
+    ENT --> ELIG
+    ELIG --> OBLIG
+    OBLIG --> REC
+    ENTFPR --> REC
+    REC --> BE
+```
+
+**Sheet tab order in the workbook** (left to right, matches the flow above):
+`ControlDetails → InputFiles → FieldMappings → Enrichments → InputFiles_TGT → FieldMappings_TGT → Enrichments_TGT → EnrichmentsTGT_FinalPostRec → Eligibility → Obligation → RecRules → BreakExplain`
+
+---
+
+## 3. Worked example: one field, start to finish
+
+Rather than reading every sheet in isolation, trace `TRADE_DATE` end-to-end. This is the pattern to replicate for any new field in a new config.
+
+```mermaid
+flowchart LR
+    A["Raw column\nTRADE_DATE\n(SRC file, e.g. dd/mm/yy)"] -->|FieldMappings\nAction=AddColumn\nTransformFunction=ConvertDateFormat| B["TradeDate_SRC\n(normalized %Y-%m-%d)"]
+    B --> C["NoOfWeekDaysBtwTradeDateAndPaymentDate_SRC\nFieldMappings, CalculateBusinessDays\ninputs: TradeDate_SRC, PaymentDate_SRC"]
+    C --> D["IsNotShortDatedForward_CTRL\nEligibility rule\nuses day-count to exclude short-dated trades"]
+    D --> E["IndepEligibility_CTRL\nEligibility rollup"]
+    B --> F["TradeDate\nRecRules StandardField\nFormula: TradeDate_SRC if IsNotNull(TradeDate_SRC) else TradeDate_TGT"]
+    F --> G["Final normalized record\n(used downstream in reporting/BI)"]
+```
+
+**Reading this pattern for a new field:**
+1. Does the raw column need reformatting/renaming only? → FieldMappings row, `CopyField` or `ConvertDateFormat`, done.
+2. Does another field depend on it (a calc, a flag)? → add a second FieldMappings row (or an Eligibility/Obligation rule) that lists it in `RuleInputs`/`TransformInputs`.
+3. Does it exist on both SRC and TGT and need to appear once in the final record? → add a `StandardField` coalesce row in RecRules.
+4. Only skip a step if the field genuinely has no downstream consumer — don't add rules "just in case."
+
+---
+
+## 4. Naming convention (apply consistently in any new config)
+
+| Suffix | Meaning | Applied on |
+|---|---|---|
+| `_SRC` | Field sourced from / derived on the **source** (internal trade system) side | FieldMappings, Enrichments |
+| `_TGT` | Field sourced from / derived on the **target** (regulator report) side | FieldMappings_TGT, Enrichments_TGT |
+| `_CTRL` | A boolean/derived **control flag** produced by a rule (Eligibility, Obligation, RecRules) | Eligibility, Obligation, RecRules |
+| `_CTRL_EXP` | A boolean/derived flag specifically for **break-explain** classification | BreakExplain |
+| `_INFO` (mid-name, e.g. `PAYMENT_DATE_INFO_SRC`) | Raw/unprocessed intermediate field kept for reference before final transform | FieldMappings |
+| No suffix (`StandardField`) | A field considered common/normalized across SRC and TGT, populated by coalescing `_SRC`/`_TGT` | RecRules |
+
+Raw incoming column names (left, `FieldName`) are typically **UPPER_SNAKE_CASE** (SRC/legacy system export) or **PascalCase / friendly names** (TGT/regulator report), while internal normalized names (`NewFieldName`) are always **PascalCase + `_SRC`/`_TGT` suffix**.
+
+---
+
+## 5. Field-level requirements: what every config must have vs what's asset-specific
+
+**Minimum required field set (every control, every asset class) — generate these without asking:**
+
+| Category | Fields |
+|---|---|
+| Identity | TradePartyTransactionId, UTI/USI equivalent, ReportingCounterpartyId, IdOfTheOtherCounterparty |
+| Dates | TradeDate, EffectiveDate/StartDate, MaturityDate/ExpirationDate, PaymentDate (if applicable) |
+| Economics | NotionalCurrency, NotionalAmount, BuySellFlag |
+| Product | ProductType (raw + normalized ISDAPlusProductType equivalent) |
+| Context (static per-row) | AssetClass, Regulation, Jurisdiction, SourceSystem, Region |
+| Status | ActionType (new/amend/cancel), TradeStatus (live/matured/terminated) |
+
+**Asset-class-additive fields (ask, or infer from the sample file's actual columns) — do not invent:**
+- Anything specific to the product mechanics of that asset class (e.g. strike/premium for options, reset frequency for swaps, delivery point for commodities)
+- Any field that only exists because of a regulator-specific reporting requirement for that asset class
+
+**Rule of thumb:** if a column appears in the raw SRC/TGT sample file and maps cleanly to a minimum-required-field concept, map it automatically. If a column doesn't obviously map to anything in the minimum set, list it as "unmapped — needs classification" rather than guessing a purpose for it.
+
+---
+
+## 6. Sheet-by-sheet schema
+
+### 6.1 `ControlDetails`
+Two columns only: `FieldName` | `FieldValue`. One row per metadata item.
+
+| FieldName | Example value | Notes |
+|---|---|---|
+| Regulation | CFTC-P45 | Regulation/rule identifier |
+| ControlName | Trade-State-Comp | Human control name |
+| ControlType | TRADESTATE | Enum: e.g. TRADESTATE, VALUATION, etc. |
+| SubControlName | (blank) | Optional sub-control |
+| AssetClass | CO | Short asset class code |
+| AssetClassLongName | Commodities | Full asset class name |
+| ControlDescription | free text | Template: "This is the {Regulation} Population Completeness Control for {Entity} {AssetClassLongName} to {Target}." |
+| BusinessDate | T-2 | Offset convention used throughout the control |
+| Frequency | DAILY | DAILY / WEEKLY / etc. |
+
+### 6.2 `InputFiles` (SRC) and `InputFiles_TGT` (TGT — same schema)
+One row per source dataset/file pattern (a control can read from multiple source systems).
+
+| Column | Meaning | Example |
+|---|---|---|
+| DataSetName | Logical name of the source system/dataset | Apollo, Murex, DTCC |
+| Environments | Comma list of environments the pattern applies in | DEV,UAT,PRE-PROD,PROD |
+| FileDirectory | Path, using `{{^RootFileDir^}}` token for the environment root | `{{^RootFileDir^}}\Source Data\Incoming Data\Apollo COMM` |
+| FileNamePattern | Regex to match the file, capturing the date/variable segment in `(.*)` | `APOLLO_COM_POS_STATE_HBEU_(.*)(.prn)$` |
+| FileType | prn / csv / gz / dat | prn |
+| FileDelimiter | Delimiter char if flat/delimited | `;` |
+| FileSource | Source system short code | APOLLO |
+| FileRegion | Region/booking hub code | HBEU, HBUS |
+| ExcelSheetName | If FileType is xlsx, which tab to read | (blank unless xlsx) |
+| FileDateSelection | Date offset convention for picking the file | T-2 |
+| FileNameDateFormat | strftime pattern matching date embedded in filename | %Y%m%d |
+| StripTopRowsCount | Header/junk rows to skip at top | 3 |
+| StripBottomRowsCount | Junk rows to strip at bottom / notes | free text allowed, e.g. "File arrives 5.30pm the next day" |
+
+Each distinct file/region/system combination = its own row. `FileNamePattern` always ends `(.*)(.<ext>)$`.
+
+### 6.3 `FieldMappings` (SRC) and `FieldMappings_TGT` (TGT — same schema)
+
+| Column | Meaning |
+|---|---|
+| Action | `AddColumn` (new derived field) or `RenameColumn` |
+| DataSetName | Must match a DataSetName from InputFiles/InputFiles_TGT |
+| FieldName | Raw incoming column name |
+| NewFieldName | Normalized internal name, `_SRC`/`_TGT` suffixed |
+| RegFieldNumber | Optional link to regulator's numbered field spec |
+| TransformFunction | See §7 decision tree |
+| TransformInputs | Comma-separated field(s)/literal(s) the function consumes, in order |
+| TransformedFromValueOrFormulaInputTypes | Type of each input, same order as TransformInputs |
+| (rightmost) Formula/value text | Free-text expression when TransformFunction = Formula |
+
+### 6.4 `Enrichments` (SRC) and `Enrichments_TGT` (TGT — same schema)
+
+| Column | Meaning |
+|---|---|
+| EnrichmentName | Logical name for the lookup |
+| LookupKeyFields | Join key field(s) on the main record |
+| StaticFileNamePattern | Regex for the reference file (comma-separated fallback patterns allowed) |
+| FileDelimiter | Delimiter of the static file |
+| FieldNames | Column(s) read from the static file |
+| NewFieldNames | Name(s) given to the joined-in field(s) |
+
+Standard reference files seen: party mapping, intragroup mapping, country/region mapping, exception/response-code extracts, LEI/legal-jurisdiction reference. **Reuse these across controls where the same static file genuinely applies — don't recreate a lookup that already exists.**
+
+`EnrichmentsTGT_FinalPostRec` = same schema, but for enrichments that can only be resolved after an initial SRC/TGT pairing pass (e.g. NACK/valuation status).
+
+### 6.5 `Eligibility`
+`Action | RuleNumber | FieldName | NewFieldName | RuleDescription | RuleFunction | RuleInputs | RuleFromValueOrFormulaInputTypes | RuleToValueOrFormula`
+
+RuleNumber: `{RegulationShortCode}-Eligibilty-NN`.
+
+**Boilerplate (reuse unchanged):** internal-trade checks (LEI-based and counterparty-based), CMACNYK exclusion, physically-settled exclusion, different-TR exclusion, US-person/affiliate check, live-trade check, expired-trade check, matured/terminated check, and the `IndepEligibility_CTRL` rollup pattern (AND-combination of the above).
+
+**Asset-class-specific (must define fresh):** reportable-product rule(s) per source entity, spot/short-dated-forward exclusion thresholds, any commodity/FX-style edge case (e.g. precious-metals-as-commodity-not-FX).
+
+### 6.6 `Obligation`
+Same column shape as Eligibility. RuleNumber: `{RegulationShortCode}-{Entity}Obligation-NN`.
+
+**Boilerplate:** entity-in-scope check (jurisdiction match), house-vs-counterparty reporting-party logic based on counterparty type + buy/sell.
+
+**Asset/source-system-specific:** booking-system prime-brokerage (PB/give-up) logic — review per new source system; final obligation rollup with `UNKNOWN` fallback when any input is unresolved.
+
+### 6.7 `RecRules`
+Same column shape. RuleNumber: `RecRules-NN`.
+
+**Boilerplate (reuse unchanged):** `ReconciliationSide` (PAIRED/SRC/TGT based on pair-key status), `IndepEligibilityObligation` (combine Eligibility+Obligation, gated by ReconciliationSide), `TRSObligation` (select the right party's obligation), `TRSVsIndepEligibilityObligation` (concatenated status string), `ReconciliationStatus` (final break/pair classification).
+
+**Generated per-config (not boilerplate, but mechanical — see §3):** the `StandardField` coalesce block — one row per field that exists on both SRC and TGT, always `Formula`, pattern `{Field}_SRC if IsNotNull({Field}_SRC) else {Field}_TGT`.
+
+### 6.8 `BreakExplain`
+Same column shape, `_CTRL_EXP` suffixed outputs. RuleNumber: `BreakExplainRule_NN`.
+
+**Boilerplate:** matured check, NACK check.
+
+**Asset-class/source-system-specific (must define with SME):** stale/blank valuation scenarios (SEF vs non-SEF), under/over-reporting patterns specific to a source system, orphan-position scenarios, any control-vs-report disagreement scenario unique to that asset class's booking behavior.
+
+---
+
+## 7. TransformFunction / RuleFunction — decision tree
+
+Use this to pick a function instead of pattern-matching from memory:
+
+```mermaid
+flowchart TD
+    Q1{Does the value\nchange per row?} -->|No, constant\nfor the whole control| SetValue
+    Q1 -->|Yes| Q2{Is it copied from\none input field,\nunchanged?}
+    Q2 -->|Yes| CopyField
+    Q2 -->|No| Q3{Is it two+ fields\njoined into a string?}
+    Q3 -->|Yes| Concatenate
+    Q3 -->|No| Q4{Is it a date field\nneeding reformatting?}
+    Q4 -->|Yes| ConvertDateFormat
+    Q4 -->|No| Q5{Is it a day-count\nbetween two dates?}
+    Q5 -->|Yes| CalculateBusinessDays
+    Q5 -->|No| Q6{Is it a code/enum\nlooked up in a fixed\nreference table?}
+    Q6 -->|Yes, must always resolve| MapValues
+    Q6 -->|Yes, ok to be blank\nif no match| MapValuesDefaultNull
+    Q6 -->|No| Formula["Formula\n(general conditional/\nboolean/string logic)"]
+```
+
+**Function reference:**
+
+| Function | Use |
+|---|---|
+| `SetValue` | Hardcode a constant/context value onto every row |
+| `CopyField` | Copy one field's value into a new field name unchanged |
+| `Formula` | General conditional/boolean/string expression |
+| `MapValues` | Look up a value in a fixed mapping table |
+| `MapValuesDefaultNull` | Same, but defaults to null if no match |
+| `Concatenate` | Join two or more fields/literals into one string |
+| `ConvertDateFormat` | Reformat a date field from one strftime pattern to another |
+| `CalculateBusinessDays` | Compute business-day count between two dates + a weekday/holiday list |
+
+**Formula syntax (provisional — confirm against real file):** conditions appear to follow `"<value>" if <condition> else "<value>"` chains (Python-conditional-expression-like), with `IsNotNull(field)` as a null check, string literals in double quotes, and `in (...)` for set membership. Field references use the exact `NewFieldName` from earlier sheets, not raw column names. **Do not invent new operators or syntax beyond this pattern without flagging it as new.**
+
+`RuleInputs`/`TransformInputs` and their `...ValueOrFormulaInputTypes` column must stay **positionally aligned** — input #3 in one list is the type of input #3 in the other.
+
+---
+
+## 8. Negative examples — what NOT to generate
+
+| Wrong | Why | Right |
+|---|---|---|
+| `TradeDate` (no suffix) in FieldMappings | Loses SRC/TGT distinction, breaks RecRules coalescing | `TradeDate_SRC` or `TradeDate_TGT` |
+| `IsEligible` (no `_CTRL`) in Eligibility | Not distinguishable from a raw data field | `IsEligible_CTRL` |
+| `RuleInputs = A,B,C` with `...InputTypes = str,int` (length mismatch) | Breaks positional alignment the engine relies on | Every input must have exactly one matching type entry |
+| Inventing a new reportable-product rule without asking | Silently encodes a compliance judgment nobody approved | Draft it, label `NEEDS SME REVIEW`, ask |
+| A brand-new TransformFunction name not in §7's table | Engine won't recognize it | Use §7's decision tree; flag explicitly if none fit |
+| Skipping the `StandardField` coalesce for a field that exists on both SRC and TGT | Field will appear twice / inconsistently downstream | Always coalesce SRC/TGT pairs in RecRules |
+| Reusing an Enrichments lookup file for a different join key without checking | Silent data-quality bug | Confirm the lookup key still applies before reusing |
+
+---
+
+## 9. Changelog / reliability notes
+
+- **v1 → v2:** added §3 (worked field-lineage example), §5 (required vs asset-specific field list), §7 decision tree + provisional formula grammar, §8 negative examples, this changelog.
+- **Known limitation:** entire doc reconstructed from photographs of one workbook (CFTC-P45 / Commodities), not the raw `.xlsx`. FieldMappings, Obligation, and RecRules formula text is the least certain section — several cells were only partially legible.
+- **Not yet verified:** exact formula grammar/operator set (§7), whether `RegFieldNumber` is populated consistently on the SRC side or only TGT, full list of static reference files beyond the ones directly observed.
+- **To increase reliability further:** replace the photo-derived formula examples with verbatim text from the real workbook, and add a second worked example (e.g. a `MapValues`-based field and a `Concatenate`-based key) alongside the date-based one in §3.
+
+---
+
+## 10. How to generate a new config from this reference
+
+1. **Confirm control identity**: Regulation, ControlName, AssetClass + long name, source system(s), target report, BusinessDate offset, Frequency.
+2. **ControlDetails** per §6.1.
+3. **InputFiles / InputFiles_TGT** per §6.2 — one row per dataset/region.
+4. **FieldMappings / FieldMappings_TGT** per §6.3 + §5's required field list + §7's decision tree. Map every SRC/TGT column that fits a required-field concept automatically; flag anything unmapped instead of guessing.
+5. **Enrichments / Enrichments_TGT** per §6.4 — reuse standard reference files where applicable; ask about anything asset-class-new.
+6. **Eligibility / Obligation / BreakExplain** per §6.5–§6.8 — generate boilerplate rules directly; draft asset-specific rules but label them `NEEDS SME REVIEW`.
+7. **RecRules** per §6.7 — boilerplate rules 1–5 unchanged; mechanically generate the `StandardField` coalesce block from whatever fields ended up in FieldMappings/FieldMappings_TGT.
+8. **Validate** against §4 naming conventions and §8's negative-example list before calling it done.
+
+---
+
+## 11. Open questions to ask before generating a brand-new config
+
+- Regulation, asset class, control one-line description?
+- Source system(s), file patterns/locations, and a real sample file (not just headers)?
+- Target regulator report format — sample file or field spec available?
+- Which existing reference/lookup files apply as-is vs need to be new?
+- Asset-class-specific eligibility rules (reportable product list, edge cases)?
+- Known break scenarios specific to this asset class/source system?
