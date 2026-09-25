@@ -1,53 +1,25 @@
-#!/usr/bin/env python3
-"""
-FIRDS FCA — combined Node 1 (enrich) + Node 2 (FCA_delta + termination).
+# =============================================================================
+# FIRDS FCA — integrated enrich + delta CSVs + 180-day terminations.
+# Run: python main.py
+# Inputs: FIRDS_FILE_PATH (XML). Outputs: FIRDS_OUTPUT_PATH (all CSVs).
+# =============================================================================
 
-Shared: count_rows, XML helpers, write_instrument_row (one implementation).
-Node-specific: file discovery, output layout, EnrichFile, termination logic.
-
-Run order when using --run all:
-  1) Node 2: DLTINS XML → FCA_delta_*.csv
-  2) Node 1: full/delta XML → FIRDS_FCA_*.csv
-  3) Node 2: FCA_delta_*.csv → termination file
-  4) Node 1 cleanup: delta_*, full_*, *.xml in input dir
-"""
-
-from __future__ import annotations
-
-import argparse
-import logging
-import shutil
-import sys
+import glob
+import os
+import warnings
 from datetime import datetime, timedelta
-from pathlib import Path
-from collections.abc import Callable
-from typing import TextIO
+from shutil import copyfile
 
 import pandas as pd
 from lxml import etree as ET
 
-logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore")
 
-NA = "NA"
-ENRICH_PREFIX = "FIRDS_FCA_"
-DEFAULT_FILE_LOCATION = "/REGQA/Source Data/Incoming Data/FIRDS/FCA"
+# Input: incoming XML (and optional legacy enrich seed if not yet in output).
+FIRDS_FILE_PATH = "/REGQA/Source Data/Incoming Data/FIRDS/FCA/"
+# Output: all generated CSVs (enrich, FCA_delta_*, terminations).
+FIRDS_OUTPUT_PATH = "/REGQA/Source Data/Outgoing Data/FIRDS/FCA/"
 TERMINATION_FILE = "FIRDS_180DAY_TERMINATIONS_FCA.csv"
-
-CSV_COLUMNS = [
-    "ISIN",
-    "Venue",
-    "ISSR",
-    "con_key",
-    "Date of Admission to Trading or Date of First Trade",
-    "CrDate",
-    "Flag",
-    "Publication Date",
-    "Termination Date",
-    "Instrument Full Name",
-    "Instrument Classification",
-    "Commodities or emission allowance derivative indicator",
-    "Expiry Date",
-]
 
 CSV_HEADER = (
     "ISIN,Venue,ISSR,con_key,Date of Admission to Trading or Date of First Trade,"
@@ -56,86 +28,110 @@ CSV_HEADER = (
     "Expiry Date\n"
 )
 
-
-# ---------------------------------------------------------------------------
-# Shared (both nodes)
-# ---------------------------------------------------------------------------
+FLAG_ERROR_NODE1 = "FULL FILE or ERROR IN ELEMENT"
+FLAG_ERROR_NODE2 = "FULL FILE OR ERROR IN ELEMENT"
 
 
-def count_rows(csv_file: Path | str) -> int:
+def _input_dir():
+    return FIRDS_FILE_PATH.rstrip(os.sep) + os.sep
+
+
+def _output_dir():
+    return FIRDS_OUTPUT_PATH.rstrip(os.sep)
+
+
+def _ensure_output_dir():
+    os.makedirs(_output_dir(), exist_ok=True)
+
+
+def _prior_enrich_path(t_2_date):
+    """Previous enrich CSV: prefer output dir, fall back to input (legacy layout)."""
+    name = "FIRDS_FCA_{}.csv".format(t_2_date)
+    out_path = os.path.join(_output_dir(), name)
+    if os.path.isfile(out_path):
+        return out_path
+    in_path = os.path.join(_input_dir(), name)
+    if os.path.isfile(in_path):
+        return in_path
+    raise FileNotFoundError(
+        "Prior enrich file not found in output or input: {}".format(name)
+    )
+
+
+def count_rows(csv_file):
     """Counts how many lines there are in the file provided."""
-    i = 0
-    with open(csv_file, "r", encoding="utf-8") as f:
-        for i, _ in enumerate(f):
+    line_count = 0
+    with open(csv_file, "r") as f:
+        for line_count, _ in enumerate(f):
             pass
-    return i
+    return line_count
 
 
-def _text(node: ET._Element, xpath: str, default: str = NA) -> str:
-    found = node.find(xpath)
-    if found is None or found.text is None:
-        return default
-    return found.text.strip()
+def _expiry_from_node(node):
+    el = node.find(".//{*}DerivInstrmAttrbts/{*}XpryDt")
+    if el is not None and el.text:
+        return el.text
+    el = node.find(".//{*}DerivInstrmAttrbts/{*}ExpiryDt")
+    if el is not None and el.text:
+        return el.text
+    return "NA"
 
 
-def _expiry_date(node: ET._Element) -> str:
-    """Node 1 used XpryDt; Node 2 screenshots used ExpiryDt — try both."""
-    for xpath in (
-        ".//{*}DerivInstrmAttrbts/{*}XpryDt",
-        ".//{*}DerivInstrmAttrbts/{*}ExpiryDt",
-    ):
-        val = _text(node, xpath, default="")
-        if val:
-            return val
-    return NA
-
-
-def _modification_flag(node: ET._Element) -> str:
-    if node.find(".//{*}ModfdRcrd") is not None:
+def _mod_flag_from_node(node, flag_error_text):
+    try:
+        node.find(".//{*}ModfdRcrd").text
         return "M"
-    if node.find(".//{*}NewRcrd") is not None:
-        return "N"
-    if node.find(".//{*}TermntdRcrd") is not None:
-        return "D"
-    return "FULL FILE or ERROR IN ELEMENT"
+    except AttributeError:
+        try:
+            node.find(".//{*}NewRcrd").text
+            return "N"
+        except AttributeError:
+            try:
+                node.find(".//{*}TermntdRcrd").text
+                return "D"
+            except AttributeError:
+                return flag_error_text
 
 
-def _creation_date(xml_root: ET._Element) -> str:
-    for hdr in xml_root.findall(".//{*}Hdr/{*}AppHdr"):
-        cre = hdr.find(".//{*}CreDt")
-        if cre is not None and cre.text:
-            return cre.text.strip()
-    return ""
+def _instrument_row_strings(node, cr_date, flag_error_text):
+    isin = node.find(".//{*}FinInstrmGnlAttrbts/{*}Id").text
+    expiry_date = _expiry_from_node(node)
+    try:
+        comm_flag = node.find(".//{*}FinInstrmGnlAttrbts/{*}CmmdtyDerivInd").text
+    except AttributeError:
+        comm_flag = "NA"
+    try:
+        issr = node.find(".//{*}Issr").text
+    except AttributeError:
+        issr = "NA"
 
+    venue = node.find(".//{*}TradgVnRltdAttrbts/{*}Id").text
+    try:
+        first_trade_date = node.find(".//{*}TradgVnRltdAttrbts/{*}FrstTradDt").text
+    except AttributeError:
+        first_trade_date = "NA"
+    try:
+        pub_dt = node.find(".//{*}PblctnPrd//{*}FrDt").text
+    except AttributeError:
+        pub_dt = "NA"
+    try:
+        term_dt = node.find(".//{*}TradgVnRltdAttrbts//{*}TermntnDt").text
+    except AttributeError:
+        term_dt = "NA"
 
-def _instrument_nodes(xml_root: ET._Element) -> list[ET._Element]:
-    nodes = xml_root.findall(".//{*}RefData")
-    if not nodes:
-        nodes = xml_root.findall(".//{*}FinInstrm")
-    if not nodes:
-        nodes = xml_root.findall(".//{*}FinInstr")
-    return nodes
+    mod_flag = _mod_flag_from_node(node, flag_error_text)
 
+    try:
+        ins_full_name = node.find(".//{*}FullNm").text.encode("utf-8").replace(",", "")
+    except AttributeError:
+        ins_full_name = "NA"
 
-def write_instrument_row(out_file: TextIO, node: ET._Element, cr_date: str) -> None:
-    """Single row writer used by both Node 1 and Node 2 CSV outputs."""
-    isin = _text(node, ".//{*}FinInstrmGnlAttrbts/{*}Id", default="")
-    venue = _text(node, ".//{*}TradgVnRltdAttrbts/{*}Id", default="")
-    issr = _text(node, ".//{*}Issr")
-    first_trade_date = _text(node, ".//{*}TradgVnRltdAttrbts/{*}FrstTradDt")
-    expiry_date = _expiry_date(node)
-    comm_flag = _text(node, ".//{*}FinInstrmGnlAttrbts/{*}CmmdtyDerivInd")
-    pub_dt = _text(node, ".//{*}PblctnPrd//{*}FrDt")
-    term_dt = _text(node, ".//{*}TradgVnRltdAttrbts//{*}TermntnDt")
-    mod_flag = _modification_flag(node)
+    try:
+        ins_classification = node.find(".//{*}ClssfctnTp").text
+    except AttributeError:
+        ins_classification = "NA"
 
-    ins_full_name = _text(node, ".//{*}FullNm")
-    if ins_full_name != NA:
-        ins_full_name = ins_full_name.replace(",", "")
-
-    ins_classification = _text(node, ".//{*}ClssfctnTp")
-
-    out_file.write(
+    line = (
         isin
         + ","
         + venue
@@ -167,406 +163,328 @@ def write_instrument_row(out_file: TextIO, node: ET._Element, cr_date: str) -> N
         + expiry_date
         + "\n"
     )
+    return line
 
 
-def _write_xml_files_to_handle(out_file: TextIO, input_files: list[Path]) -> None:
-    for file_path in input_files:
-        root = ET.parse(str(file_path)).getroot()
-        cr_date = _creation_date(root)
-        for node in _instrument_nodes(root):
-            write_instrument_row(out_file, node, cr_date)
+def parse_xml_file_to_lines(xml_path, flag_error_text):
+    """Parse one FIRDS XML file into CSV line strings (no header)."""
+    lines = []
+    with open(xml_path) as f:
+        xml = ET.parse(f)
+    cr_date = ""
+    hdr_nodes = xml.findall(".//{*}Hdr/{*}AppHdr")
+    for hdr_node in hdr_nodes:
+        cre = hdr_node.find(".//{*}CreDt")
+        if cre is not None and cre.text:
+            cr_date = cre.text
+
+    instrument_nodes = xml.findall(".//{*}RefData")
+    if not instrument_nodes:
+        instrument_nodes = xml.findall(".//{*}FinInstrm")
+
+    for node in instrument_nodes:
+        lines.append(_instrument_row_strings(node, cr_date, flag_error_text))
+    return lines
 
 
-def _parse_to_csv_legacy(output_path: Path, fill: Callable[[TextIO], None]) -> int:
-    """D3S-style: header if empty, write body, return data line count."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as out_file:
-        lines_before_writing = count_rows(output_path)
-        if lines_before_writing <= 1:
-            out_file.write(CSV_HEADER)
-        fill(out_file)
-    return count_rows(output_path) - lines_before_writing
-
-
-def parse_and_write_to_csv_v2_single(
-    input_files: list[Path], output_path: Path
-) -> int:
-    """Node 1: all XML files → one CSV (full_*.csv or delta_*.csv)."""
-    return _parse_to_csv_legacy(
-        output_path,
-        lambda out: _write_xml_files_to_handle(out, input_files),
-    )
-
-
-def parse_and_write_to_csv_v2_fca_delta(
-    input_files: list[Path], file_location: Path
-) -> int:
-    """Node 2: one XML file → FCA_delta_{n}.csv under file_location."""
-    file_location.mkdir(parents=True, exist_ok=True)
-    lines_written = 0
-    for index, file_path in enumerate(input_files, start=1):
-        output_path = file_location / f"FCA_delta_{index}.csv"
-        lines_written += _parse_to_csv_legacy(
-            output_path,
-            lambda out, path=file_path: _write_xml_files_to_handle(out, [path]),
-        )
+def parse_and_write_to_csv_combined(input_file_list, file_location, flag_error_text=FLAG_ERROR_NODE1):
+    """Node 1 style: all XML inputs appended into one CSV path."""
+    out_file = open(file_location, "w")
+    lines_before_writing = count_rows(file_location)
+    if lines_before_writing <= 1:
+        out_file.write(CSV_HEADER)
+    for file_path in input_file_list:
+        for line in parse_xml_file_to_lines(file_path, flag_error_text):
+            out_file.write(line)
+    lines_written = count_rows(file_location) - lines_before_writing
+    out_file.close()
     return lines_written
 
 
-# ---------------------------------------------------------------------------
-# Node 1 — enrich / FIRDS_FCA_*.csv
-# ---------------------------------------------------------------------------
+def parse_and_write_to_csv_per_xml(input_file_list, file_location, flag_error_text=FLAG_ERROR_NODE2):
+    """Node 2 style: one FCA_delta_{n}.csv per input XML."""
+    counter = 1
+    total_written = 0
+    for file_path in input_file_list:
+        full_file_location = os.path.join(
+            file_location, "FCA_delta_{}.csv".format(counter)
+        )
+        out_file = open(full_file_location, "w")
+        lines_before_writing = count_rows(full_file_location)
+        if lines_before_writing <= 1:
+            out_file.write(CSV_HEADER)
+        for line in parse_xml_file_to_lines(file_path, flag_error_text):
+            out_file.write(line)
+        total_written += count_rows(full_file_location) - lines_before_writing
+        out_file.close()
+        counter += 1
+    return total_written
 
 
-def get_file_paths(
-    folder: Path, date_yyyymmdd: str, extension: str
-) -> tuple[list[Path], list[Path]]:
-    delta_files: list[Path] = []
-    full_files: list[Path] = []
-    ext = extension.lower()
-
-    for path in folder.iterdir():
-        if not path.is_file():
-            continue
-        name = path.name
-        name_lower = name.lower()
-        if date_yyyymmdd not in name or ext not in name_lower:
-            continue
-        if "dltins" in name_lower:
-            delta_files.append(path)
-        if "fulins" in name_lower:
-            full_files.append(path)
-
-    return delta_files, full_files
+def get_file_paths(fldr, dt, format_ext):
+    d_lst = []
+    f_lst = []
+    for file_name in os.listdir(fldr):
+        if file_name.find(dt) > -1:
+            if file_name.lower().find(format_ext.lower()) > -1:
+                if file_name.lower().find("dltins") > -1:
+                    d_lst.append(fldr + file_name)
+                if file_name.lower().find("fulins") > -1:
+                    f_lst.append(fldr + file_name)
+    return d_lst, f_lst
 
 
-def _merge_columns(suffix: str) -> list[str]:
-    return [
-        f"{col}_{suffix}" if col != "con_key" else "con_key" for col in CSV_COLUMNS
+def enrich_file(enrichfile, deltafile):
+    full = pd.read_csv(enrichfile)
+    delta = pd.read_csv(deltafile)
+
+    temp = pd.merge(full, delta[(delta.Flag == "D")], on="con_key", how="left")
+
+    temp_not_d = temp[(temp.Flag_y != "D")]
+    temp_not_d = temp_not_d[
+        [
+            "ISIN_x",
+            "Venue_x",
+            "ISSR_x",
+            "con_key",
+            "Date of Admission to Trading or Date of First Trade_x",
+            "CrDate_x",
+            "Flag_x",
+            "Publication Date_x",
+            "Termination Date_x",
+            "Instrument Full Name_x",
+            "Instrument Classification_x",
+            "Commodities or emission allowance derivative indicator_x",
+            "Expiry Date_x",
+        ]
+    ]
+    temp_not_d.columns = [
+        "ISIN",
+        "Venue",
+        "ISSR",
+        "con_key",
+        "Date of Admission to Trading or Date of First Trade",
+        "CrDate",
+        "Flag",
+        "Publication Date",
+        "Termination Date",
+        "Instrument Full Name",
+        "Instrument Classification",
+        "Commodities or emission allowance derivative indicator",
+        "Expiry Date",
     ]
 
+    temp_n = delta[(delta.Flag == "N")]
 
-def EnrichFile(enrich_path: Path, delta_path: Path) -> None:
-    full = pd.read_csv(enrich_path)
-    delta = pd.read_csv(delta_path)
+    temp_d = temp[(temp.Flag_y == "D")]
+    temp_d = temp_d[
+        [
+            "ISIN_y",
+            "Venue_y",
+            "ISSR_y",
+            "con_key",
+            "Date of Admission to Trading or Date of First Trade_y",
+            "CrDate_y",
+            "Flag_y",
+            "Publication Date_y",
+            "Termination Date_y",
+            "Instrument Full Name_y",
+            "Instrument Classification_y",
+            "Commodities or emission allowance derivative indicator_y",
+            "Expiry Date_y",
+        ]
+    ]
+    temp_d.columns = [
+        "ISIN",
+        "Venue",
+        "ISSR",
+        "con_key",
+        "Date of Admission to Trading or Date of First Trade",
+        "CrDate",
+        "Flag",
+        "Publication Date",
+        "Termination Date",
+        "Instrument Full Name",
+        "Instrument Classification",
+        "Commodities or emission allowance derivative indicator",
+        "Expiry Date",
+    ]
 
-    temp = pd.merge(full, delta[delta["Flag"] == "D"], on="con_key", how="left")
-
-    tempNotD = temp.loc[temp["Flag_y"] != "D", _merge_columns("x")]
-    tempNotD.columns = CSV_COLUMNS
-
-    tempN = delta[delta["Flag"] == "N"]
-
-    tempD = temp.loc[temp["Flag_y"] == "D", _merge_columns("y")]
-    tempD.columns = CSV_COLUMNS
-
-    final = pd.concat([tempNotD, tempN, tempD], ignore_index=True)
+    final = pd.concat([temp_not_d, temp_n, temp_d])
     final = final[final["Flag"] != "D"]
-    final.to_csv(enrich_path, encoding="utf-8", index=False)
+    final.to_csv(enrichfile, encoding="utf-8", index=False)
 
 
-def _weekend_adjusted_offsets(run_weekday: int) -> tuple[int, int]:
+def compute_node1_schedule(run_date):
+    """Node 1: day_hist, t_1/t_2 dates, and calendar days to process (in order)."""
+    day = run_date.weekday()
     day_hist = 1
     t_2_hist = 2
-    if (run_weekday - day_hist) < 0:
-        day_hist += 2
-        t_2_hist += 2
-    elif (run_weekday - day_hist) == 0:
-        t_2_hist += 2
-    return day_hist, t_2_hist
 
-
-def _trim_old_enrich_files(folder: Path, keep: int = 3) -> None:
-    records: list[tuple[str, str]] = []
-    for path in folder.glob(f"{ENRICH_PREFIX}*.csv"):
-        records.append((str(path), path.stem.replace(ENRICH_PREFIX, "")))
-    if not records:
-        return
-    df = pd.DataFrame(records, columns=["FileName", "FileDate"])
-    df["FileDate"] = pd.to_datetime(df["FileDate"], errors="coerce")
-    df = (
-        df.dropna(subset=["FileDate"])
-        .sort_values("FileDate", ascending=False)
-        .reset_index(drop=True)
-    )
-    if len(df) > keep:
-        for path_str in df["FileName"].iloc[keep:]:
-            Path(path_str).unlink(missing_ok=True)
-
-
-def cleanup_node1_working_files(folder: Path) -> None:
-    for pattern in ("delta*.csv", "full*.csv", "*.xml"):
-        for path in folder.glob(pattern):
-            path.unlink(missing_ok=True)
-
-
-def run_node1_enrich(
-    input_dir: Path,
-    backfill_days: int = 0,
-    keep_enrich_files: int = 3,
-    cleanup_intermediate: bool = True,
-) -> Path:
-    input_dir = input_dir.resolve()
-    input_dir.mkdir(parents=True, exist_ok=True)
-
-    run_anchor = datetime.today() - timedelta(days=backfill_days)
-    run_date = run_anchor.date()
-    day_hist, t_2_hist = _weekend_adjusted_offsets(run_anchor.weekday())
+    if (day - day_hist) < 0:
+        day_hist = day_hist + 2
+        t_2_hist = t_2_hist + 2
+    elif (day - day_hist) == 0:
+        t_2_hist = t_2_hist + 2
 
     t_1_date = run_date - timedelta(days=day_hist)
     t_2_date = run_date - timedelta(days=t_2_hist)
-    process_date = t_1_date
 
-    enrich_path = input_dir / f"{ENRICH_PREFIX}{t_1_date}.csv"
-    previous_enrich_path = input_dir / f"{ENRICH_PREFIX}{t_2_date}.csv"
-
-    if not previous_enrich_path.is_file():
-        raise FileNotFoundError(
-            f"Previous enrich file required at {previous_enrich_path}."
-        )
-
-    shutil.copyfile(previous_enrich_path, enrich_path)
-    logger.info("Node 1: copied %s -> %s", previous_enrich_path, enrich_path)
-
+    loop_date = t_1_date
+    loop_dates = []
     for _ in range(day_hist):
-        delta_files, full_files = get_file_paths(
-            input_dir, process_date.strftime("%Y%m%d"), "xml"
-        )
-        used_full = False
-        if full_files:
-            full_csv = input_dir / f"full_{process_date}.csv"
-            parse_and_write_to_csv_v2_single(full_files, full_csv)
-            shutil.copyfile(full_csv, enrich_path)
-            used_full = True
-            logger.info("Node 1: full snapshot from %d XML(s)", len(full_files))
+        loop_dates.append(loop_date)
+        loop_date += timedelta(days=1)
 
-        if delta_files and not used_full:
-            delta_csv = input_dir / f"delta_{process_date}.csv"
-            parse_and_write_to_csv_v2_single(delta_files, delta_csv)
-            EnrichFile(enrich_path, delta_csv)
-            logger.info("Node 1: enriched from %d delta XML(s)", len(delta_files))
-
-        process_date += timedelta(days=1)
-
-    _trim_old_enrich_files(input_dir, keep=keep_enrich_files)
-    if cleanup_intermediate:
-        cleanup_node1_working_files(input_dir)
-
-    return enrich_path
+    return day_hist, t_1_date, t_2_date, loop_dates
 
 
-# ---------------------------------------------------------------------------
-# Node 2 — FCA_delta_* + termination
-# ---------------------------------------------------------------------------
-
-
-def get_file_dates() -> list[str]:
-    date = datetime.today().date()
-    if date.weekday() == 0:
-        dates = [date - timedelta(days=i) for i in range(1, 4)]
+def get_file_dates(run_date):
+    """Node 2: YYYYMMDD strings for delta XML filenames."""
+    day_of_week = run_date.weekday()
+    if day_of_week == 0:
+        dates = [run_date - timedelta(days=i) for i in range(1, 4)]
     else:
-        dates = [date - timedelta(days=1)]
+        dates = [run_date - timedelta(days=1)]
     return [d.strftime("%Y%m%d") for d in dates]
 
 
-def get_delta_files(firds_input_dir: Path) -> list[Path]:
-    valid_dates = get_file_dates()
-    files: list[Path] = []
-    for path in firds_input_dir.iterdir():
-        if not path.is_file() or not path.name.endswith(".xml"):
-            continue
-        name_upper = path.name.upper()
-        if "DLTINS" not in name_upper:
-            continue
-        if not any(d in path.name for d in valid_dates):
-            continue
-        files.append(path)
-    return files
+def get_delta_files(firds_dir, valid_date_strings):
+    xml_files = [
+        os.path.join(firds_dir, file)
+        for file in os.listdir(firds_dir)
+        if file.endswith(".xml")
+        and "DLTINS" in file.upper()
+        and any(dt in file for dt in valid_date_strings)
+    ]
+    return xml_files
 
 
-def process_file_node2(firds_input_dir: Path, file_location: Path) -> int:
-    matching_files = get_delta_files(firds_input_dir)
+def clear_fca_delta_outputs(file_location):
+    """Remove prior FCA_delta_*.csv so termination logic does not read stale files."""
+    for path in glob.glob(os.path.join(file_location, "FCA_delta*.csv")):
+        os.remove(path)
+
+
+def process_delta_and_terminations(
+    firds_dir, file_location, termination_file, run_date, raise_on_no_delta=False
+):
+    """
+    Node 2 outputs. If no delta XML matches: skip by default so Node 1 enrich can still
+    run (e.g. full-file-only day). Set raise_on_no_delta=True to match legacy Node 2.
+    """
+    matching_files = get_delta_files(firds_dir, get_file_dates(run_date))
     if not matching_files:
-        raise ValueError("no files")
-    return parse_and_write_to_csv_v2_fca_delta(matching_files, file_location)
+        if raise_on_no_delta:
+            raise ValueError("no files")
+        return
+    clear_fca_delta_outputs(file_location)
+    parse_and_write_to_csv_per_xml(matching_files, file_location)
+    firds_termination_file(file_location, termination_file, run_date)
 
 
-def _termination_dates_as_date(series: pd.Series) -> pd.Series:
-    """Match legacy D3S: parse → str YYYY-MM-DD → .date objects."""
-    parsed = pd.to_datetime(series, errors="coerce")
-    return pd.to_datetime(parsed.dt.strftime("%Y-%m-%d"), errors="coerce").dt.date
+def firds_termination_file(file_location, termination_file, run_date):
+    pattern = os.path.join(file_location, "FCA_delta*.csv")
+    delta_files = glob.glob(pattern)
+    if not delta_files:
+        return
 
+    all_data = pd.concat([pd.read_csv(file) for file in delta_files])
 
-def firds_termination_file(file_location: Path, termination_file: str) -> Path:
-    delta_paths = sorted(file_location.glob("FCA_delta*.csv"))
-    all_data = (
-        pd.concat([pd.read_csv(p) for p in delta_paths], ignore_index=True)
-        if delta_paths
-        else pd.DataFrame()
-    )
+    all_data["Termination Date"] = pd.to_datetime(
+        all_data["Termination Date"], errors="coerce"
+    ).dt.tz_localize(None)
 
-    run_date = datetime.today().date()
+    date = run_date
 
-    if not all_data.empty:
-        term = pd.to_datetime(all_data["Termination Date"], errors="coerce").dt.tz_localize(
-            None
-        )
-        all_data = all_data.assign(_term=term)
-        df_latest_filtered = all_data[
-            (all_data["_term"] < pd.Timestamp(run_date))
-            | (all_data["_term"].isna() & (all_data["Flag"] == "D"))
-        ].drop(columns="_term")
+    cond1 = all_data["Termination Date"] < date
+    cond2 = all_data["Termination Date"].isna() & (all_data["Flag"] == "D")
+    df_latest_filtered = all_data[cond1 | cond2]
+
+    termination_path = os.path.join(file_location, termination_file)
+
+    if os.path.exists(termination_path):
+        df_termination = pd.read_csv(termination_path)
     else:
-        df_latest_filtered = all_data
+        df_termination = pd.DataFrame()
 
-    termination_path = file_location / termination_file
-    df_termination = (
-        pd.read_csv(termination_path) if termination_path.is_file() else pd.DataFrame()
-    )
     df_updated = pd.concat([df_termination, df_latest_filtered], ignore_index=True)
+    df_updated["Termination Date"] = pd.to_datetime(
+        df_updated["Termination Date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    df_updated["Termination Date"] = pd.to_datetime(
+        df_updated["Termination Date"], errors="coerce"
+    ).dt.date
 
-    if not df_updated.empty and "Termination Date" in df_updated.columns:
-        df_updated["Termination Date"] = _termination_dates_as_date(
-            df_updated["Termination Date"]
-        )
-        term_as_dt = pd.to_datetime(df_updated["Termination Date"], errors="coerce")
-        df_updated["Append_date"] = (pd.Timestamp(run_date) - term_as_dt).dt.days
-        df_final = df_updated[df_updated["Append_date"] <= 180]
-    else:
-        df_final = df_updated
-
+    df_updated["Append_date"] = (date - df_updated["Termination Date"]).dt.days
+    df_final = df_updated[df_updated["Append_date"] <= 180]
     df_final.to_csv(termination_path, index=False)
-    return termination_path
 
 
-def run_node2_delta_and_termination(
-    firds_input_dir: Path,
-    file_location: Path,
-    termination_file: str = TERMINATION_FILE,
-    skip_xml_parse: bool = False,
-) -> Path:
-    file_location.mkdir(parents=True, exist_ok=True)
-    if not skip_xml_parse:
-        process_file_node2(firds_input_dir, file_location)
-    return firds_termination_file(file_location, termination_file)
+def run_enrich_pipeline(input_dir, output_dir, run_date):
+    _, t_1_date, t_2_date, loop_dates = compute_node1_schedule(run_date)
+
+    enrich_file_path = os.path.join(output_dir, "FIRDS_FCA_{}.csv".format(t_1_date))
+    pre_enrich_file_path = _prior_enrich_path(t_2_date)
+
+    copyfile(pre_enrich_file_path, enrich_file_path)
+
+    for date in loop_dates:
+        d_files, f_files = get_file_paths(
+            input_dir, str(date.strftime("%Y%m%d")), "xml"
+        )
+
+        f_flag = 0
+        if f_files:
+            op_file = os.path.join(output_dir, "full_{}.csv".format(date))
+            parse_and_write_to_csv_combined(f_files, op_file)
+            copyfile(op_file, enrich_file_path)
+            f_flag = 1
+
+        if d_files and f_flag == 0:
+            op_file = os.path.join(output_dir, "delta_{}.csv".format(date))
+            parse_and_write_to_csv_combined(d_files, op_file)
+            enrich_file(enrich_file_path, op_file)
+
+    l1 = []
+    enrich_glob = os.path.join(output_dir, "FIRDS_FCA_*.csv")
+    for file in glob.glob(enrich_glob):
+        l1.append([file, file[-14:][:10]])
+    df = pd.DataFrame(l1, columns=["FileName", "FileDate"])
+    df["FileDate"] = pd.to_datetime(df["FileDate"])
+    df = df.sort_values("FileDate", ascending=False).reset_index(drop=True)
+
+    if len(df) > 3:
+        for i in range(3, len(df)):
+            os.remove(df["FileName"].iloc[i])
+
+    for file in glob.glob(os.path.join(output_dir, "delta*.csv")):
+        os.remove(file)
+    for file in glob.glob(os.path.join(output_dir, "full*.csv")):
+        os.remove(file)
+    for file in glob.glob(os.path.join(input_dir, "*.xml")):
+        os.remove(file)
 
 
-# ---------------------------------------------------------------------------
-# Combined pipeline
-# ---------------------------------------------------------------------------
-
-
-def run_all(
-    firds_input_dir: Path,
-    file_location: Path,
-    backfill_days: int = 0,
-    keep_enrich_files: int = 3,
-    termination_file: str = TERMINATION_FILE,
-) -> tuple[Path, Path]:
+def run_pipeline(raise_on_no_delta=False):
     """
-    Full D3S-equivalent outputs:
-      - FCA_delta_*.csv + termination CSV (Node 2)
-      - FIRDS_FCA_*.csv (Node 1)
+    Full integrated run: Node 2 (delta + terminations) then Node 1 (enrich + cleanup).
+    Node 2 must run before XML deletion in Node 1.
     """
-    firds_input_dir = firds_input_dir.resolve()
-    file_location = file_location.resolve()
+    run_date = datetime.today().date()
+    _ensure_output_dir()
 
-    logger.info("Step 1/4: Node 2 — XML to FCA_delta_*.csv")
-    process_file_node2(firds_input_dir, file_location)
-
-    logger.info("Step 2/4: Node 1 — enrich (XML kept until step 4)")
-    enrich_path = run_node1_enrich(
-        firds_input_dir,
-        backfill_days=backfill_days,
-        keep_enrich_files=keep_enrich_files,
-        cleanup_intermediate=False,
+    input_dir = _input_dir()
+    output_dir = _output_dir()
+    process_delta_and_terminations(
+        input_dir.rstrip(os.sep),
+        output_dir,
+        TERMINATION_FILE,
+        run_date,
+        raise_on_no_delta=raise_on_no_delta,
     )
-
-    logger.info("Step 3/4: Node 2 — termination file")
-    termination_path = firds_termination_file(file_location, termination_file)
-
-    logger.info("Step 4/4: Node 1 — cleanup working files in input dir")
-    cleanup_node1_working_files(firds_input_dir)
-
-    return enrich_path, termination_path
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="FIRDS FCA combined Node 1 + Node 2 ETL.",
-    )
-    parser.add_argument(
-        "--firds-input-dir",
-        type=Path,
-        required=True,
-        help="FCA_Input folder (XML + FIRDS_FCA_*.csv).",
-    )
-    parser.add_argument(
-        "--file-location",
-        type=Path,
-        default=Path(DEFAULT_FILE_LOCATION),
-        help="Node 2 output folder (FCA_delta_*, termination).",
-    )
-    parser.add_argument(
-        "--termination-file",
-        default=TERMINATION_FILE,
-    )
-    parser.add_argument(
-        "--backfill-days",
-        type=int,
-        default=0,
-        help="Node 1 run date offset only.",
-    )
-    parser.add_argument(
-        "--keep-enrich-files",
-        type=int,
-        default=3,
-    )
-    parser.add_argument(
-        "--run",
-        choices=("all", "node1", "node2"),
-        default="all",
-        help="all = both nodes in safe order; node1/node2 = single node only.",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args(argv)
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(message)s",
-    )
-
-    try:
-        if args.run == "node1":
-            out = run_node1_enrich(
-                args.firds_input_dir,
-                backfill_days=args.backfill_days,
-                keep_enrich_files=args.keep_enrich_files,
-            )
-            print(out)
-        elif args.run == "node2":
-            run_node2_delta_and_termination(
-                args.firds_input_dir,
-                args.file_location,
-                termination_file=args.termination_file,
-            )
-            print(args.file_location / args.termination_file)
-        else:
-            enrich_path, term_path = run_all(
-                args.firds_input_dir,
-                args.file_location,
-                backfill_days=args.backfill_days,
-                keep_enrich_files=args.keep_enrich_files,
-                termination_file=args.termination_file,
-            )
-            print(enrich_path)
-            print(term_path)
-    except (FileNotFoundError, ValueError) as exc:
-        logger.error("%s", exc)
-        return 1
-
-    return 0
+    run_enrich_pipeline(input_dir, output_dir, run_date)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_pipeline()
